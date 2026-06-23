@@ -23,12 +23,12 @@ def load_config():
                         help='Path of dataset')
     parser.add_argument('--code-length', default=32, type=int,
                         help='Binary hash code length.(default: 32)')
-    parser.add_argument('--lr', default=1e-4, type=float,
-                        help='Learning rate.(default: 1e-4)')
-    parser.add_argument('--epoch', default=100, type=int,
-                        help='max epoch.(default: 100)')
-    parser.add_argument('--classify_epoch', default=100, type=int,
-                        help='max epoch for classification.(default: 100)')
+    parser.add_argument('--lr', default=7e-5, type=float,
+                        help='Learning rate.(default: 7e-5 for CIFAR-100, 1e-4 for other datasets)')
+    parser.add_argument('--epoch', default=300, type=int,
+                        help='max epoch.(default: 300)')
+    parser.add_argument('--classify_epoch', default=300, type=int,
+                        help='max epoch for classification.(default: 300)')
     parser.add_argument('--test-map', default=5, type=int,
                         help='test frequency.(default: 10)')
     parser.add_argument('--beta', default=1.00, type=float,
@@ -45,8 +45,8 @@ def load_config():
                         help='picture resize size.(default: 256)')
     parser.add_argument('--crop-size', default=224, type=int,
                         help='picture crop size.(default: 224)')
-    parser.add_argument('--gpu', default=4, type=int,
-                        help='Using gpu.(default: False)')
+    parser.add_argument('--gpu', default=0, type=int,
+                        help='Using gpu.(default: 0)')
 
     args = parser.parse_args()
 
@@ -79,7 +79,8 @@ if __name__ == '__main__':
     if os.path.exists(f'./save/HashCenters/{args.dataset}_SHC_HashCenters_bit_{args.code_length}.pt'):
         print('==========SHC HashCenters has already generated==========')
         H = torch.load(f'./save/HashCenters/{args.dataset}_SHC_HashCenters_bit_{args.code_length}.pt')
-    H = GenerateSemanticHashCenters(args, S)
+    else:
+        H = GenerateSemanticHashCenters(args, S)
     H = H.to(args.device)
 
     # Stage 3: Train the Deep Hashing Network

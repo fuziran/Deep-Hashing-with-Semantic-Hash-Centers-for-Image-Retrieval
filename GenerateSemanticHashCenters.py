@@ -13,7 +13,7 @@ import time
 # torch.manual_seed(4)
 
 if torch.cuda.is_available():
-    device = torch.device("cuda:4")
+    device = torch.device("cuda:0")
 else:
     device = torch.device("cpu")
 def get_margin(bit, n_class):
@@ -342,7 +342,7 @@ def GenerateSemanticHashCenters(args, S):
             else:
                 K[i, j] = args.code_length - 2 * d - H[:, i].T @ H[:, j]
 
-    lambd =  torch.full((args.code_length, args.num_classes), 0.1)
+    lambd =  torch.full((args.code_length, args.num_classes), 0)
     lambd = lambd.to(device)
     rho = 0.2
     miu = 0.625
@@ -352,7 +352,7 @@ def GenerateSemanticHashCenters(args, S):
     beta = beta.to(device)
     eta = 0.5  # 不同数据集这个参数影响挺大的，可以多调调
     print('eta: ', eta)
-    epochs = 30
+    epochs = 20
     inner_epochs = 3
 
     min_loss = 999
@@ -394,7 +394,6 @@ def GenerateSemanticHashCenters(args, S):
                         continue
                     else:
                         sum += 2 * miu * H[:, j] - 2 * alpha[i, j] * H[:, j] + beta[i, j] * (2 * H[:, j] @ H[:, j].T * H[:, i] - 2 * (args.code_length - 2 * d - K[i, j]) * H[:, j])
-                sum /= 10000
                 der = (2 / (args.code_length ** 2) * M @ M.T @ H[:, i] - 2 / args.code_length * M @ S[:, i]) + lambd[:, i].T + rho * (H[:, i] - M[:, i]) + sum
 
                 H_tmp = H.clone()
@@ -412,7 +411,10 @@ def GenerateSemanticHashCenters(args, S):
 
         # alpha-step
         for i in range(args.num_classes):
-            alpha[i, j] = alpha[i, j] + beta[i, j] * (args.code_length - 2 * d - H[:, i].T @ H[:, j] - K[i, j])
+            for j in range(args.num_classes):
+                if i == j:
+                    continue
+                alpha[i, j] = alpha[i, j] + beta[i, j] * (args.code_length - 2 * d - H[:, i].T @ H[:, j] - K[i, j])
         loss1 = (((S - 1 / args.code_length * H.T @ H) ** 2).sum() / (args.num_classes ** 2)).item()
         loss2 = 0
         for i in range(args.num_classes):
