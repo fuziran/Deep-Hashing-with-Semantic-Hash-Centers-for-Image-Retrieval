@@ -5,6 +5,25 @@ from torchvision import models
 import torch
 
 
+class SEBlock(nn.Module):
+    """Squeeze-and-Excitation channel attention block."""
+    def __init__(self, channels, reduction=16):
+        super(SEBlock, self).__init__()
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channels, max(channels // reduction, 4)),
+            nn.ReLU(inplace=True),
+            nn.Linear(max(channels // reduction, 4), channels),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x):
+        b, c = x.size(0), x.size(1)
+        w = self.pool(x).view(b, c)
+        w = self.fc(w).view(b, c, 1, 1)
+        return x * w
+
+
 class AlexNet(nn.Module):
     def __init__(self, hash_bit, pretrained=True):
         super(AlexNet, self).__init__()
@@ -41,44 +60,68 @@ resnet_dict = {"ResNet18": models.resnet18, "ResNet34": models.resnet34, "ResNet
 
 
 class ResNet(nn.Module):
+    """ResNet backbone with multi-scale SE-attention feature extraction (Innovation 1).
+
+    Extracts features from three stages of ResNet34:
+      - layer2: 128 channels  (28x28 for 224-input)
+      - layer3: 256 channels  (14x14)
+      - layer4: 512 channels  (7x7)
+    Each scale is recalibrated by a Squeeze-and-Excitation block, then
+    globally average-pooled and concatenated (128+256+512=896-d) before
+    being projected to the hash code.
+    """
     def __init__(self, hash_bit, res_model="ResNet34"):
         super(ResNet, self).__init__()
         if os.path.exists('./save/resnet34-b627a593.pth'):
             model_resnet = resnet_dict[res_model](pretrained=False)
-            pre = torch.load('./models_ckpt/resnet34-b627a593.pth')  # 进行加载
+            pre = torch.load('./models_ckpt/resnet34-b627a593.pth')
             model_resnet.load_state_dict(pre)
         else:
             model_resnet = resnet_dict[res_model](pretrained=True)
 
-        self.conv1 = model_resnet.conv1
-        self.bn1 = model_resnet.bn1
-        self.relu = model_resnet.relu
+        self.conv1   = model_resnet.conv1
+        self.bn1     = model_resnet.bn1
+        self.relu    = model_resnet.relu
         self.maxpool = model_resnet.maxpool
-        self.layer1 = model_resnet.layer1
-        self.layer2 = model_resnet.layer2
-        self.layer3 = model_resnet.layer3
-        self.layer4 = model_resnet.layer4
-        self.avgpool = model_resnet.avgpool
-        self.feature_layers = nn.Sequential(self.conv1, self.bn1, self.relu, self.maxpool, \
-                                            self.layer1, self.layer2, self.layer3, self.layer4, self.avgpool)
+        self.layer1  = model_resnet.layer1
+        self.layer2  = model_resnet.layer2
+        self.layer3  = model_resnet.layer3
+        self.layer4  = model_resnet.layer4
+        self.gap     = nn.AdaptiveAvgPool2d(1)
 
-        self.hash_layer = nn.Linear(model_resnet.fc.in_features, hash_bit)
-        self.hash_layer.weight.data.normal_(0, 0.01)
-        self.hash_layer.bias.data.fill_(0.0)
+        # SE channel-attention at each scale (ResNet34 channels: 128 / 256 / 512)
+        self.se2 = SEBlock(128)
+        self.se3 = SEBlock(256)
+        self.se4 = SEBlock(512)
 
-        self.tanh = nn.Tanh()
-        # self.layer_hash = nn.Linear(model_resnet.fc.in_features, hash_bit)
-        # self.layer_hash.weight.data.normal_(0, 0.01)
-        # self.layer_hash.bias.data.fill_(0.0)
-        # self.hash_layer = nn.Sequential(self.layer_hash, nn.BatchNorm1d(hash_bit, momentum=0.1))
+        # Fusion projection: 128+256+512=896 → 512 → hash_bit
+        self.hash_layer = nn.Sequential(
+            nn.Linear(128 + 256 + 512, 512),
+            nn.BatchNorm1d(512),
+            nn.ReLU(inplace=True),
+            nn.Linear(512, hash_bit),
+        )
+        self.hash_layer[-1].weight.data.normal_(0, 0.01)
+        self.hash_layer[-1].bias.data.fill_(0.0)
 
     def forward(self, x):
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.maxpool(x)
+        x = self.layer1(x)            # [B,  64, 56, 56]
 
-        x = self.feature_layers(x)
-        x = x.view(x.size(0), -1)
-        x = self.hash_layer(x)
-        # x = self.tanh(x)
-        return x
+        f2 = self.layer2(x)           # [B, 128, 28, 28]
+        f3 = self.layer3(f2)          # [B, 256, 14, 14]
+        f4 = self.layer4(f3)          # [B, 512,  7,  7]
+
+        f2 = self.gap(self.se2(f2)).view(f2.size(0), -1)   # [B, 128]
+        f3 = self.gap(self.se3(f3)).view(f3.size(0), -1)   # [B, 256]
+        f4 = self.gap(self.se4(f4)).view(f4.size(0), -1)   # [B, 512]
+
+        feat = torch.cat([f2, f3, f4], dim=1)              # [B, 896]
+        return self.hash_layer(feat)
+
 
 class NewNet(nn.Module):
     def __init__(self, hash_bit, pretrained=True):
@@ -87,14 +130,11 @@ class NewNet(nn.Module):
         self.encoder_q = ResNet(hash_bit)
         self.encoder_k = ResNet(hash_bit)
         for param_q, param_k in zip(self.encoder_q.parameters(), self.encoder_k.parameters()):
-            param_k.data.copy_(param_q.data)  # initialize
-            param_k.requires_grad = False  # not update by gradient
+            param_k.data.copy_(param_q.data)
+            param_k.requires_grad = False
 
     @torch.no_grad()
     def _momentum_update_key_encoder(self):
-        """
-        Momentum update of the key encoder
-        """
         for param_q, param_k in zip(self.encoder_q.parameters(), self.encoder_k.parameters()):
             param_k.data = param_k.data * self.m + param_q.data * (1. - self.m)
 
@@ -105,16 +145,16 @@ class NewNet(nn.Module):
             encode_x2 = self.encoder_k(x)
         return encode_x, encode_x2
 
+
 class ClassifyNet(nn.Module):
     def __init__(self, n_class, res_model="ResNet34"):
         super(ClassifyNet, self).__init__()
         if os.path.exists('./save/resnet34-b627a593.pth'):
             model_resnet = resnet_dict[res_model](pretrained=False)
-            pre = torch.load('./models_ckpt/resnet34-b627a593.pth')  # 进行加载
+            pre = torch.load('./models_ckpt/resnet34-b627a593.pth')
             model_resnet.load_state_dict(pre)
         else:
             model_resnet = resnet_dict[res_model](pretrained=True)
-
 
         self.conv1 = model_resnet.conv1
         self.bn1 = model_resnet.bn1
@@ -125,7 +165,7 @@ class ClassifyNet(nn.Module):
         self.layer3 = model_resnet.layer3
         self.layer4 = model_resnet.layer4
         self.avgpool = model_resnet.avgpool
-        self.feature_layers = nn.Sequential(self.conv1, self.bn1, self.relu, self.maxpool, \
+        self.feature_layers = nn.Sequential(self.conv1, self.bn1, self.relu, self.maxpool,
                                             self.layer1, self.layer2, self.layer3, self.layer4, self.avgpool)
 
         self.classify_layer = nn.Linear(model_resnet.fc.in_features, n_class)
@@ -133,101 +173,63 @@ class ClassifyNet(nn.Module):
         self.classify_layer.weight.data.normal_(0, 0.01)
         self.classify_layer.bias.data.fill_(0.0)
 
-        # self.tanh = nn.Tanh()
-        # self.layer_hash = nn.Linear(model_resnet.fc.in_features, hash_bit)
-        # self.layer_hash.weight.data.normal_(0, 0.01)
-        # self.layer_hash.bias.data.fill_(0.0)
-        # self.hash_layer = nn.Sequential(self.layer_hash, nn.BatchNorm1d(hash_bit, momentum=0.1))
-
     def forward(self, x):
-
         x = self.feature_layers(x)
         x = x.view(x.size(0), -1)
         x = self.classify_layer(x)
         y = self.softmax(x)
-        # x = self.tanh(x)
         return x, y
 
 
 class LTHNet(nn.Module):
     def __init__(self, origin_model, feature_dim=2000, code_length=64, num_classes=100, num_prototypes=100):
         super(LTHNet, self).__init__()
-        # self.dynamic_meta_embedding = dynamic_meta_embedding
         self.feature_dim = feature_dim
         self.code_length = code_length
         self.num_classes = num_classes
         self.num_prototypes = num_prototypes
 
-        # direct features
         self.features = nn.Sequential(*list(origin_model.children())[:-1])
         self.fc = nn.Linear(512, feature_dim)
 
-        # dynamic meta-embedding
         self.fc_hallucinator = nn.Linear(feature_dim, num_prototypes)
         self.fc_selector = nn.Linear(feature_dim, feature_dim)
         self.attention = nn.Softmax(dim=1)
 
-        # hash layer and classifier
         self.hash_layer = nn.Linear(feature_dim, code_length)
-
         self.classifier = nn.Linear(code_length, num_classes)
         self.assignments = nn.Softmax(dim=1)
 
     def forward(self, x, dynamic_meta_embedding, prototypes):
-        # generate the feature
-        #print(x.shape)
-        #data = x
-        #Image.open(data)
-
-
         x = self.features(x)
         x = x.view(x.size(0), -1)
         x = nn.ReLU()(x)
         x = self.fc(x)
         x = nn.ReLU()(x)
 
-        # storing direct feature
         direct_feature = x
 
         if dynamic_meta_embedding:
-            # visual memory: consisted of prototypes, each of which represents a center of one semantic structure.
-            # visual_memory = prototypes, sized by [num_prototypes, feature_dim].
             if prototypes.size(0) != self.num_prototypes or prototypes.size(1) != self.feature_dim:
-                print(prototypes.size(0))
-                print(prototypes.size(1))
-                print(prototypes.size(0) != self.num_prototypes)
-                print(prototypes.size(1) != self.feature_dim)
                 print('prototypes error')
                 return
 
-            # computing memory_feature by querying and associating visual memory (prototypes)
             attention = self.fc_hallucinator(x)
             attention = self.attention(attention)
             memory_feature = torch.matmul(attention, prototypes)
 
-            # computing concept selector
             concept_selector = self.fc_selector(x)
             concept_selector = nn.Tanh()(concept_selector)
 
-            # infused feature
             x_meta = direct_feature + concept_selector * memory_feature
-
-            # generate hashing
             x = self.hash_layer(x_meta)
             hash_codes = nn.Tanh()(x)
-
-            # class assignments
             assignments = self.classifier(hash_codes)
             assignments = self.assignments(assignments)
-
         else:
-            x_meta = direct_feature  # no dynamic meta-embedding
-
-            # generate hashing
+            x_meta = direct_feature
             x = self.hash_layer(x_meta)
             hash_codes = nn.Tanh()(x)
-
-            # class assignments
             assignments = self.classifier(hash_codes)
             assignments = self.assignments(assignments)
 
@@ -239,7 +241,7 @@ class orthohashNet(nn.Module):
         super(orthohashNet, self).__init__()
         if os.path.exists('./save/resnet34-b627a593.pth'):
             model_resnet = resnet_dict[res_model](pretrained=False)
-            pre = torch.load('./models_ckpt/resnet34-b627a593.pth')  # 进行加载
+            pre = torch.load('./models_ckpt/resnet34-b627a593.pth')
             model_resnet.load_state_dict(pre)
         else:
             model_resnet = resnet_dict[res_model](pretrained=True)
@@ -253,7 +255,7 @@ class orthohashNet(nn.Module):
         self.layer3 = model_resnet.layer3
         self.layer4 = model_resnet.layer4
         self.avgpool = model_resnet.avgpool
-        self.feature_layers = nn.Sequential(self.conv1, self.bn1, self.relu, self.maxpool, \
+        self.feature_layers = nn.Sequential(self.conv1, self.bn1, self.relu, self.maxpool,
                                             self.layer1, self.layer2, self.layer3, self.layer4, self.avgpool)
 
         self.hash_layer = nn.Linear(model_resnet.fc.in_features, hash_bit)
@@ -261,19 +263,12 @@ class orthohashNet(nn.Module):
         self.hash_layer.bias.data.fill_(0.0)
 
         self.ce_fc = nn.Linear(hash_bit, nclass)
-        # self.tanh = nn.Tanh()
-        # self.layer_hash = nn.Linear(model_resnet.fc.in_features, hash_bit)
-        # self.layer_hash.weight.data.normal_(0, 0.01)
-        # self.layer_hash.bias.data.fill_(0.0)
-        # self.hash_layer = nn.Sequential(self.layer_hash, nn.BatchNorm1d(hash_bit, momentum=0.1))
 
     def forward(self, x):
-
         x = self.feature_layers(x)
         x = x.view(x.size(0), -1)
         x = self.hash_layer(x)
         y = self.ce_fc(x)
-        # x = self.tanh(x)
         return y, x
 
     def get_hash_params(self):
