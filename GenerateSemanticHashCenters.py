@@ -453,6 +453,11 @@ def GenerateSemanticHashCenters(args, S):
     print('similarity_match: ', similarity_match.item())
     print('mean_hamming_distance: ', mean_hamming_distance.item())
     print('min_d_fre: ', min_d_fre.item() / 2)
-    torch.save(H, f'./save/HashCenters/{args.dataset}_SHC_HashCenters_bit_{args.code_length}.pt')
+    shc_hash_center_path = getattr(
+        args,
+        'shc_hash_center_path',
+        f'./save/HashCenters/{args.dataset}_SHC_HashCenters_bit_{args.code_length}.pt'
+    )
+    torch.save(H, shc_hash_center_path)
     print('==========success generate SHC HashCenters==========')
     return H

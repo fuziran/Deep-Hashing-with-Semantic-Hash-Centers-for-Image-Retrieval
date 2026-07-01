@@ -6,12 +6,18 @@ from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 from torchvision import transforms
 
+""" 数据加载模块
+当前版本只支持CIFAR-100
+ """
 
+
+""" 读取CIFAR-100 原始 pickle 文件 """
 def _unpickle(file_path):
     with open(file_path, "rb") as f:
         return pickle.load(f, encoding="latin1")
 
 
+""" 自动寻找 CIFAR-100 原始数据目录，要求存在 train 和 test 文件 """
 def _resolve_cifar100_root(root):
     candidates = [
         root,
@@ -33,6 +39,8 @@ def _resolve_cifar100_root(root):
     )
 
 
+
+""" 加载 CIFAR-100 的训练集和测试集，并把原始 N x 3072 数据还原成 N x 32 x 32 x 3 图像 """
 def _load_cifar100_raw(root):
     root = _resolve_cifar100_root(root)
 
@@ -54,6 +62,11 @@ def _load_cifar100_raw(root):
     return images, labels
 
 
+""" 按类别划分数据：训练集、查询集、数据库集
+每类 100 张训练
+每类 50 张 query/test
+每类 450 张 database
+ """
 def _stratified_split_cifar100(labels, seed=60):
     """
     CIFAR-100 has 100 classes and 600 images per class.
@@ -72,6 +85,8 @@ def _stratified_split_cifar100(labels, seed=60):
         idx = np.where(labels == c)[0]
         rng.shuffle(idx)
 
+
+        """ 每个类别独立采样，保证类别平衡 """
         train_indices.extend(idx[:100])
         query_indices.extend(idx[100:150])
         database_indices.extend(idx[150:])
@@ -109,6 +124,10 @@ class CIFAR100HashDataset(Dataset):
         label = torch.zeros(self.num_classes, dtype=torch.float32)
         label[label_id] = 1.0
 
+
+        """  img: 处理后的图像张量
+             label: one-hot编码 (100维)
+             real_idx: 原始数据索引 (用于追踪) """
         return img, label, torch.tensor(real_idx, dtype=torch.long)
 
 

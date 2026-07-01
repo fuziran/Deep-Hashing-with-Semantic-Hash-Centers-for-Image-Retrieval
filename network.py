@@ -4,6 +4,7 @@ import torch.nn as nn
 from torchvision import models
 import torch
 
+""" 网络结构定义文件，包含多个模型 """
 
 class AlexNet(nn.Module):
     def __init__(self, hash_bit, pretrained=True):

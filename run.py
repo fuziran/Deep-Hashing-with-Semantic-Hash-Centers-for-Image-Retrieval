@@ -8,7 +8,10 @@ from GenerateSimilarityMatrix import GenerateSimilarityMatrix
 from GenerateSemanticHashCenters import GenerateSemanticHashCenters
 from train import train_val
 
+""" 项目主入口
+解析命令行参数、设置设备、指定默认网络为ResNet,然后按三阶段顺序执行 """
 
+""" 定义训练参数 """
 def load_config():
     parser = argparse.ArgumentParser(description='SHC_PyTorch')
     parser.add_argument('--seed', default=60, type=int,
@@ -35,6 +38,14 @@ def load_config():
                         help='para')
     parser.add_argument('--lambd', default=0.0001, type=float,
                         help='para')
+    parser.add_argument('--use-diffusion', default=True, type=lambda x: str(x).lower() != 'false',
+                        help='Enable high-order semantic diffusion. Use false to disable.')
+    parser.add_argument('--diff-alpha', default=0.15, type=float,
+                        help='Semantic diffusion decay factor.')
+    parser.add_argument('--diff-steps', default=3, type=int,
+                        help='Number of semantic diffusion hops.')
+    parser.add_argument('--sim-topk', default=0, type=int,
+                        help='Top-k semantic neighbours per class. 0 means max(10, num_classes//10).')
     parser.add_argument('--topK', default=[-1, 100, 1000], type=int,
                         help='Calculate map of top k.(default: all)')
     parser.add_argument('--batch-size', default=64, type=int,
@@ -56,6 +67,9 @@ def load_config():
     else:
         args.device = torch.device("cuda:%d" % args.gpu)
 
+    if args.sim_topk == 0:
+        args.sim_topk = max(10, args.num_classes // 10)
+
     # net
     args.net = ResNet
 
@@ -64,24 +78,39 @@ def load_config():
 
 if __name__ == '__main__':
     args = load_config()
+    """ 加载数据 """
     # load data
     train_loader, test_loader, database_loader, num_train, num_test, num_database = load_data(args)
-
+    """ 如果本地已有 ./save/SimilarityMatrix/...pt，直接读取相似度矩阵；否则调用 GenerateSimilarityMatrix() 生成。 """
     # Stage1：Construct the Data-dependent Pairwise Similarity Matrix
-    if os.path.exists(f'./save/SimilarityMatrix/{args.dataset}_Similarity_Matrix.pt'):
+    if args.use_diffusion:
+        sim_suffix = f'_diff_a{args.diff_alpha}_s{args.diff_steps}_k{args.sim_topk}'
+    else:
+        sim_suffix = '_nodiff'
+    sim_path = f'./save/SimilarityMatrix/{args.dataset}_Similarity_Matrix{sim_suffix}.pt'
+    hash_center_path = f'./save/HashCenters/{args.dataset}_SHC_HashCenters_bit_{args.code_length}{sim_suffix}.pt'
+    args.shc_hash_center_path = hash_center_path
+
+    if os.path.exists(sim_path):
         print('==========SimilarityMatrix has already generated==========')
-        S = torch.load(f'./save/SimilarityMatrix/{args.dataset}_Similarity_Matrix.pt')
+        S = torch.load(sim_path)
     else:
         S = GenerateSimilarityMatrix(args, train_loader, test_loader)
+        os.makedirs('./save/SimilarityMatrix/', exist_ok=True)
+        torch.save(S, sim_path)
     S = S.to(args.device)
 
+    """ 如果本地已有 ./save/HashCenters/...pt，直接读取哈希中心；否则调用 GenerateSemanticHashCenters() 生成。 """
     # Stage 2: Generate the Semantic Hash Centers
-    if os.path.exists(f'./save/HashCenters/{args.dataset}_SHC_HashCenters_bit_{args.code_length}.pt'):
+    if os.path.exists(hash_center_path):
         print('==========SHC HashCenters has already generated==========')
-        H = torch.load(f'./save/HashCenters/{args.dataset}_SHC_HashCenters_bit_{args.code_length}.pt')
+        H = torch.load(hash_center_path)
     else:
         H = GenerateSemanticHashCenters(args, S)
+        os.makedirs('./save/HashCenters/', exist_ok=True)
+        torch.save(H, hash_center_path)
     H = H.to(args.device)
 
+    """ 训练哈希网络 """
     # Stage 3: Train the Deep Hashing Network
     train_val(args, H, train_loader, test_loader, database_loader, num_database)
