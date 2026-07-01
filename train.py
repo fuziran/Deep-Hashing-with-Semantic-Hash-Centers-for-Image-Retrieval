@@ -20,6 +20,8 @@ torch.multiprocessing.set_sharing_strategy('file_system')
 
 
 class CSQLoss(torch.nn.Module):
+    """CSQ loss with optional bit-balance and bit-independence regularization."""
+
     def __init__(self, args, bit, hash_center):
         super(CSQLoss, self).__init__()
         self.is_single_label = True
@@ -28,12 +30,30 @@ class CSQLoss(torch.nn.Module):
         self.criterion = torch.nn.BCELoss().to(args.device)
 
     def forward(self, u, y, ind, args):
-        u = u.tanh()
+        u_tanh = u.tanh()
         hash_center = self.label2center(y)
-        center_loss = self.criterion(0.5 * (u + 1), 0.5 * (hash_center + 1))
-        Q_loss = (u.abs() - 1).pow(2).mean()
+        center_loss = self.criterion(0.5 * (u_tanh + 1), 0.5 * (hash_center + 1))
+        Q_loss = (u_tanh.abs() - 1).pow(2).mean()
 
-        return center_loss + args.lambd * Q_loss
+        loss = center_loss + args.lambd * Q_loss
+
+        alpha_bal = getattr(args, 'alpha_bal', 0.0)
+        if alpha_bal > 0:
+            bit_mean = u_tanh.mean(dim=0)
+            balance_loss = bit_mean.pow(2).mean()
+            loss = loss + alpha_bal * balance_loss
+
+        alpha_ind = getattr(args, 'alpha_ind', 0.0)
+        if alpha_ind > 0:
+            u_center = u_tanh - u_tanh.mean(dim=0, keepdim=True)
+            cov = (u_center.T @ u_center) / u_tanh.size(0)
+            diag = torch.diag(cov).clamp(min=1e-8)
+            corr = cov / (diag.unsqueeze(0) * diag.unsqueeze(1)).sqrt()
+            eye = torch.eye(corr.size(0), device=corr.device)
+            independence_loss = (corr - eye).pow(2).mean()
+            loss = loss + alpha_ind * independence_loss
+
+        return loss
 
     def label2center(self, y):
         hash_center = self.hash_targets[y.argmax(axis=1)]

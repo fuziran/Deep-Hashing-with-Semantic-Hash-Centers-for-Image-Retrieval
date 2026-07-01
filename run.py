@@ -35,6 +35,10 @@ def load_config():
                         help='para')
     parser.add_argument('--lambd', default=0.0001, type=float,
                         help='para')
+    parser.add_argument('--alpha-bal', default=0.01, type=float,
+                        help='Bit balance regularization weight. Set 0 to disable.')
+    parser.add_argument('--alpha-ind', default=0.001, type=float,
+                        help='Bit independence regularization weight. Set 0 to disable.')
     parser.add_argument('--topK', default=[-1, 100, 1000], type=int,
                         help='Calculate map of top k.(default: all)')
     parser.add_argument('--batch-size', default=64, type=int,
