@@ -37,44 +37,47 @@ def _load_cifar100_raw(root):
     root = _resolve_cifar100_root(root)
 
     train_obj = _unpickle(os.path.join(root, "train"))
-    test_obj  = _unpickle(os.path.join(root, "test"))
+    test_obj = _unpickle(os.path.join(root, "test"))
 
-    train_data   = train_obj["data"]
-    test_data    = test_obj["data"]
+    train_data = train_obj["data"]
+    test_data = test_obj["data"]
+
     train_labels = np.array(train_obj["fine_labels"], dtype=np.int64)
-    test_labels  = np.array(test_obj["fine_labels"],  dtype=np.int64)
+    test_labels = np.array(test_obj["fine_labels"], dtype=np.int64)
 
-    data   = np.concatenate([train_data, test_data], axis=0)
+    data = np.concatenate([train_data, test_data], axis=0)
     labels = np.concatenate([train_labels, test_labels], axis=0)
 
     # CIFAR raw format: N x 3072, ordered as R(1024), G(1024), B(1024)
     images = data.reshape(-1, 3, 32, 32).transpose(0, 2, 3, 1)
+
     return images, labels
 
 
 def _stratified_split_cifar100(labels, seed=60):
     """
-    CIFAR-100: 600 images per class (100 classes).
+    CIFAR-100 has 100 classes and 600 images per class.
     Paper setting:
-      training:  10 000 = 100/class
-      query:      5 000 =  50/class
-      database:  45 000 = 450/class
+      training: 10000 = 100/class
+      query:     5000 =  50/class
+      database: 45000 = 450/class
     """
     rng = np.random.RandomState(seed)
 
-    train_indices    = []
-    query_indices    = []
+    train_indices = []
+    query_indices = []
     database_indices = []
 
     for c in range(100):
         idx = np.where(labels == c)[0]
         rng.shuffle(idx)
+
         train_indices.extend(idx[:100])
         query_indices.extend(idx[100:150])
         database_indices.extend(idx[150:])
 
-    train_indices    = np.array(train_indices,    dtype=np.int64)
-    query_indices    = np.array(query_indices,    dtype=np.int64)
+    train_indices = np.array(train_indices, dtype=np.int64)
+    query_indices = np.array(query_indices, dtype=np.int64)
     database_indices = np.array(database_indices, dtype=np.int64)
 
     rng.shuffle(train_indices)
@@ -97,13 +100,13 @@ class CIFAR100HashDataset(Dataset):
 
     def __init__(self, images, labels, indices, num_classes=100,
                  transform=None, transform_aug=None, dual_view=False):
-        self.images       = images
-        self.labels       = labels
-        self.indices      = indices
-        self.num_classes  = num_classes
-        self.transform    = transform
+        self.images = images
+        self.labels = labels
+        self.indices = indices
+        self.num_classes = num_classes
+        self.transform = transform
         self.transform_aug = transform_aug if transform_aug is not None else transform
-        self.dual_view    = dual_view
+        self.dual_view = dual_view
 
     def __len__(self):
         return len(self.indices)
@@ -209,6 +212,7 @@ def load_data(args):
         pin_memory=pin_memory,
         drop_last=False,
     )
+
     test_loader = DataLoader(
         test_dataset,
         batch_size=args.batch_size,
@@ -217,6 +221,7 @@ def load_data(args):
         pin_memory=pin_memory,
         drop_last=False,
     )
+
     database_loader = DataLoader(
         database_dataset,
         batch_size=args.batch_size,
