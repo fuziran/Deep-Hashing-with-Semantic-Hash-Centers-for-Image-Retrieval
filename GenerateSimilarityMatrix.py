@@ -9,23 +9,11 @@ from network import *
 from loguru import logger
 
 
-# ---------------------------------------------------------------------------
-# Innovation 5: High-order semantic diffusion helpers
-# ---------------------------------------------------------------------------
-
 def _high_order_diffusion(S, alpha=0.15, steps=3):
     """Graph diffusion to propagate transitive semantic relations.
 
     S_diffused = sum_{k=0}^{steps} alpha^k * T^k
     where T is the row-normalised off-diagonal similarity (random-walk matrix).
-
-    Args:
-        S     : [n, n] symmetric similarity matrix, diagonal = 1
-        alpha : propagation decay factor (0 < alpha < 1)
-        steps : number of diffusion hops
-
-    Returns:
-        S_final: [n, n] fused matrix (original weighted 0.7 + diffused 0.3)
     """
     device = S.device
     n = S.size(0)
@@ -34,7 +22,7 @@ def _high_order_diffusion(S, alpha=0.15, steps=3):
     S_off.fill_diagonal_(0.0)
 
     row_sum = S_off.sum(dim=1, keepdim=True).clamp(min=1e-8)
-    T = S_off / row_sum          # row-normalised transition matrix
+    T = S_off / row_sum
 
     S_diffused = torch.eye(n, device=device)
     T_power = T.clone()
@@ -44,30 +32,22 @@ def _high_order_diffusion(S, alpha=0.15, steps=3):
         T_power = T_power @ T
         coeff = coeff * alpha
 
-    # symmetrise and restore self-similarity
     S_diffused = (S_diffused + S_diffused.T) / 2.0
     S_diffused.fill_diagonal_(1.0)
 
-    # weighted fusion: keep 70% original signal, add 30% diffused context
     S_final = 0.7 * S + 0.3 * S_diffused
     S_final.fill_diagonal_(1.0)
     return S_final
 
 
 def _sparse_topk_similarity(S, topk):
-    """Keep only top-k neighbours per class; zero-out weak similarities.
-
-    Reduces noise from weakly-related classes while preserving strong
-    semantic cues.  The result is re-symmetrised so the matrix stays
-    symmetric.
-    """
+    """Keep only top-k neighbours per class; zero-out weak similarities."""
     n = S.size(0)
     S_sparse = torch.zeros_like(S)
     for i in range(n):
         row = S[i].clone()
-        row[i] = float('-inf')               # exclude self
+        row[i] = float('-inf')
         vals, idx = torch.topk(row, k=min(topk, n - 1))
-        # only keep neighbours with positive similarity
         mask = vals > 0
         S_sparse[i, idx[mask]] = vals[mask]
 
@@ -75,10 +55,6 @@ def _sparse_topk_similarity(S, topk):
     S_sparse.fill_diagonal_(1.0)
     return S_sparse
 
-
-# ---------------------------------------------------------------------------
-# Stage 1 helpers
-# ---------------------------------------------------------------------------
 
 def TrainClassificationNetwork(args, train_loader, test_loader):
     print('==========start to generate ClassificationNetwork==========')
@@ -103,6 +79,7 @@ def TrainClassificationNetwork(args, train_loader, test_loader):
         this_lr_str = "{:.5e}".format(this_lr)
         net.train()
         for data, targets, index in train_loader:
+            # print(data.shape)
             targets = targets.to(torch.float32)
             data, targets, index = data.to(args.device), targets.to(args.device), index.to(args.device)
             optimizer.zero_grad()
@@ -135,35 +112,29 @@ def TrainClassificationNetwork(args, train_loader, test_loader):
             if test_pre > best_pre:
                 best_pre = test_pre
             testing_time = time.time() - tic
-            logger.info(
-                '[iter:{}/{}][dataset:{}][lr:{}][loss:{:.2f}]'
-                '[train_pre:{:.4f}%][test_pre:{:.4f}%][best_pre:{:.4f}%]'
-                '[training_time:{:.2f}][testing_time:{:.2f}]'.format(
-                    epoch + 1,
-                    args.classify_epoch,
-                    args.dataset,
-                    this_lr_str,
-                    running_loss / args.test_map,
-                    100 * train_pre,
-                    100 * test_pre,
-                    100 * best_pre,
-                    training_time,
-                    testing_time,
-                ))
+            logger.info('[iter:{}/{}][dataset:{}][lr:{}][loss:{:.2f}][train_pre:{:.4f}%][test_pre:{:.4f}%][best_pre:{:.4f}%][training_time:{:.2f}][testing_time:{:.2f}]'.format(
+                epoch + 1,
+                args.classify_epoch,
+                args.dataset,
+                this_lr_str,
+                running_loss / args.test_map,
+                100 * train_pre,
+                100 * test_pre,
+                100 * best_pre,
+                training_time,
+                testing_time,
+            ))
             running_loss = 0.
-    os.makedirs('./save/ClassificationNet/', exist_ok=True)
+    os.makedirs(f'./save/ClassificationNet/', exist_ok=True)
     torch.save(net, f'./save/ClassificationNet/{args.dataset}_ClassificationNet.pt')
     print('==========success generate ClassificationNetwork==========')
     return net
-
-
 def GenerateSimilarityMatrix(args, train_loader, test_loader):
     if os.path.exists(f'./save/ClassificationNet/{args.dataset}_ClassificationNet.pt'):
         print('==========ClassificationNet has already generated==========')
         net = torch.load(f'./save/ClassificationNet/{args.dataset}_ClassificationNet.pt').to(args.device)
     else:
         net = TrainClassificationNetwork(args, train_loader, test_loader)
-
     print('==========start to generate SimilarityMatrix==========')
     S = torch.zeros(args.num_classes, args.num_classes).to(args.device)
     net.eval()
@@ -171,12 +142,12 @@ def GenerateSimilarityMatrix(args, train_loader, test_loader):
         for data, targets, index in train_loader:
             data, targets, index = data.to(args.device), targets.to(args.device), index.to(args.device)
             batch_size = targets.shape[0]
-            p_dis, _ = net(data)
-            _, true_targets = torch.max(targets, 1)
+            p_dis, _ = net(data) # p_dis就是p_0
+            _, true_targets = torch.max(targets, 1) # 获得要mask的j，矩阵形式
             for i in range(batch_size):
                 tmp = p_dis[i].clone()
-                tmp[true_targets[i]] = float('-inf')
-                S[true_targets[i]] += F.softmax(tmp, dim=0)
+                tmp[true_targets[i]] = float('-inf') # 对最大值做mask（变成-INF）
+                S[true_targets[i]] += F.softmax(tmp)
 
     mask = torch.eye(args.num_classes).bool().to(args.device)
     S = (S + S.T) / 2

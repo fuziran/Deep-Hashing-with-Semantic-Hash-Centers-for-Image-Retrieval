@@ -37,44 +37,47 @@ def _load_cifar100_raw(root):
     root = _resolve_cifar100_root(root)
 
     train_obj = _unpickle(os.path.join(root, "train"))
-    test_obj  = _unpickle(os.path.join(root, "test"))
+    test_obj = _unpickle(os.path.join(root, "test"))
 
-    train_data   = train_obj["data"]
-    test_data    = test_obj["data"]
+    train_data = train_obj["data"]
+    test_data = test_obj["data"]
+
     train_labels = np.array(train_obj["fine_labels"], dtype=np.int64)
-    test_labels  = np.array(test_obj["fine_labels"],  dtype=np.int64)
+    test_labels = np.array(test_obj["fine_labels"], dtype=np.int64)
 
-    data   = np.concatenate([train_data, test_data], axis=0)
+    data = np.concatenate([train_data, test_data], axis=0)
     labels = np.concatenate([train_labels, test_labels], axis=0)
 
     # CIFAR raw format: N x 3072, ordered as R(1024), G(1024), B(1024)
     images = data.reshape(-1, 3, 32, 32).transpose(0, 2, 3, 1)
+
     return images, labels
 
 
 def _stratified_split_cifar100(labels, seed=60):
     """
-    CIFAR-100: 600 images per class (100 classes).
+    CIFAR-100 has 100 classes and 600 images per class.
     Paper setting:
-      training:  10 000 = 100/class
-      query:      5 000 =  50/class
-      database:  45 000 = 450/class
+      training: 10000 = 100/class
+      query:     5000 =  50/class
+      database: 45000 = 450/class
     """
     rng = np.random.RandomState(seed)
 
-    train_indices    = []
-    query_indices    = []
+    train_indices = []
+    query_indices = []
     database_indices = []
 
     for c in range(100):
         idx = np.where(labels == c)[0]
         rng.shuffle(idx)
+
         train_indices.extend(idx[:100])
         query_indices.extend(idx[100:150])
         database_indices.extend(idx[150:])
 
-    train_indices    = np.array(train_indices,    dtype=np.int64)
-    query_indices    = np.array(query_indices,    dtype=np.int64)
+    train_indices = np.array(train_indices, dtype=np.int64)
+    query_indices = np.array(query_indices, dtype=np.int64)
     database_indices = np.array(database_indices, dtype=np.int64)
 
     rng.shuffle(train_indices)
@@ -85,25 +88,12 @@ def _stratified_split_cifar100(labels, seed=60):
 
 
 class CIFAR100HashDataset(Dataset):
-    """CIFAR-100 dataset for deep hashing.
-
-    Innovation 3: when ``dual_view=True`` (training only), each sample is
-    returned as two independently-augmented views (img1, img2, label, idx)
-    so the contrastive consistency loss can enforce hash-code agreement
-    across different augmentations of the same image.
-
-    Standard mode returns (img, label, idx).
-    """
-
-    def __init__(self, images, labels, indices, num_classes=100,
-                 transform=None, transform_aug=None, dual_view=False):
-        self.images       = images
-        self.labels       = labels
-        self.indices      = indices
-        self.num_classes  = num_classes
-        self.transform    = transform
-        self.transform_aug = transform_aug if transform_aug is not None else transform
-        self.dual_view    = dual_view
+    def __init__(self, images, labels, indices, num_classes=100, transform=None):
+        self.images = images
+        self.labels = labels
+        self.indices = indices
+        self.num_classes = num_classes
+        self.transform = transform
 
     def __len__(self):
         return len(self.indices)
@@ -113,34 +103,13 @@ class CIFAR100HashDataset(Dataset):
         img = Image.fromarray(self.images[real_idx])
         label_id = int(self.labels[real_idx])
 
+        if self.transform is not None:
+            img = self.transform(img)
+
         label = torch.zeros(self.num_classes, dtype=torch.float32)
         label[label_id] = 1.0
 
-        idx_tensor = torch.tensor(real_idx, dtype=torch.long)
-
-        if self.dual_view:
-            # Two independently-augmented views of the same image
-            img1 = self.transform(img)
-            img2 = self.transform_aug(img)
-            return img1, img2, label, idx_tensor
-        else:
-            img = self.transform(img)
-            return img, label, idx_tensor
-
-
-def _build_augment_transform(resize_size, crop_size, normalize):
-    """Stronger augmentation for the second view in contrastive training."""
-    return transforms.Compose([
-        transforms.Resize(resize_size),
-        transforms.RandomResizedCrop(crop_size, scale=(0.5, 1.0)),
-        transforms.RandomHorizontalFlip(),
-        transforms.ColorJitter(
-            brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1
-        ),
-        transforms.RandomGrayscale(p=0.2),
-        transforms.ToTensor(),
-        normalize,
-    ])
+        return img, label, torch.tensor(real_idx, dtype=torch.long)
 
 
 def load_data(args):
@@ -175,28 +144,20 @@ def load_data(args):
         normalize,
     ])
 
-    # Innovation 3: enable dual-view for training when contrastive loss is active
-    use_dual_view = getattr(args, 'alpha_cont', 0.0) > 0.0
-    aug_transform = _build_augment_transform(args.resize_size, args.crop_size, normalize)
-
     train_dataset = CIFAR100HashDataset(
         images, labels, train_idx,
         num_classes=args.num_classes,
         transform=train_transform,
-        transform_aug=aug_transform,
-        dual_view=use_dual_view,
     )
     test_dataset = CIFAR100HashDataset(
         images, labels, query_idx,
         num_classes=args.num_classes,
         transform=test_transform,
-        dual_view=False,
     )
     database_dataset = CIFAR100HashDataset(
         images, labels, database_idx,
         num_classes=args.num_classes,
         transform=test_transform,
-        dual_view=False,
     )
 
     pin_memory = args.device.type == "cuda"
@@ -209,6 +170,7 @@ def load_data(args):
         pin_memory=pin_memory,
         drop_last=False,
     )
+
     test_loader = DataLoader(
         test_dataset,
         batch_size=args.batch_size,
@@ -217,6 +179,7 @@ def load_data(args):
         pin_memory=pin_memory,
         drop_last=False,
     )
+
     database_loader = DataLoader(
         database_dataset,
         batch_size=args.batch_size,
@@ -226,8 +189,7 @@ def load_data(args):
         drop_last=False,
     )
 
-    mode = "dual-view" if use_dual_view else "single-view"
-    print(f"========== CIFAR-100 dataset loaded ({mode}) ==========")
+    print("========== CIFAR-100 dataset loaded ==========")
     print(f"train: {len(train_dataset)}, query: {len(test_dataset)}, database: {len(database_dataset)}")
 
     return (
