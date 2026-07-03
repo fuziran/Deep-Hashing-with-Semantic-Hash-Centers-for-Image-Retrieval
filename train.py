@@ -2,6 +2,7 @@ import copy
 
 from utils.tools import *
 from network import *
+from GenerateSemanticHashCenters import get_margin
 
 import os
 import torch
@@ -20,12 +21,23 @@ torch.multiprocessing.set_sharing_strategy('file_system')
 
 
 class CSQLoss(torch.nn.Module):
-    def __init__(self, args, bit, hash_center):
+    def __init__(self, args, bit, hash_center, S=None):
         super(CSQLoss, self).__init__()
         self.is_single_label = True
         self.hash_targets = hash_center.to(args.device)
         self.multi_label_random_center = torch.randint(2, (bit,)).float().to(args.device)
         self.criterion = torch.nn.BCELoss().to(args.device)
+
+        self.bit = bit
+        self.n_class = hash_center.shape[0]
+        self.use_proxy_margin = bool(getattr(args, 'use_semantic_margin_proxy_loss', False))
+        self.margin_matrix = None
+        if self.use_proxy_margin:
+            assert S is not None, (
+                "CSQLoss: S (Stage-1 similarity matrix) must be provided when "
+                "--use-semantic-margin-proxy-loss is set."
+            )
+            self.margin_matrix = self._build_margin_matrix(args, bit, self.n_class, S)
 
     def forward(self, u, y, ind, args):
         u = u.tanh()
@@ -33,11 +45,72 @@ class CSQLoss(torch.nn.Module):
         center_loss = self.criterion(0.5 * (u + 1), 0.5 * (hash_center + 1))
         Q_loss = (u.abs() - 1).pow(2).mean()
 
-        return center_loss + args.lambd * Q_loss
+        loss = center_loss + args.lambd * Q_loss
+
+        if self.use_proxy_margin:
+            proxy_loss = self._semantic_margin_proxy_loss(u, y)
+            loss = loss + args.proxy_margin_weight * proxy_loss
+
+        return loss
 
     def label2center(self, y):
         hash_center = self.hash_targets[y.argmax(axis=1)]
         return hash_center
+
+    def _build_margin_matrix(self, args, bit, n_class, S):
+        """
+        Build an (n_class, n_class) matrix M where M[c, k] is the target minimum
+        Hamming-distance margin between class c's and class k's proxy codes:
+          - M[c, k] close to `lo` when classes c, k are semantically SIMILAR (S[c,k] high)
+          - M[c, k] close to `hi` when classes c, k are semantically DISSIMILAR (S[c,k] low)
+        `lo`/`hi` come from the same get_margin(bit, n_class) used by Stage 2's ADMM.
+        get_margin's two return values are not reliably ordered, so take min/max defensively.
+        """
+        d_a, d_b = get_margin(bit, n_class)
+        lo = float(min(d_a, d_b))
+        hi = float(max(d_a, d_b))
+        if hi - lo < 1e-6:
+            hi = lo + 1.0
+        lo = max(lo, 0.0)
+        hi = min(max(hi, lo + 1e-6), float(bit))
+        print(f"[ProxyMarginLoss] bit={bit} n_class={n_class} "
+              f"get_margin()=({d_a},{d_b}) -> using margin range [{lo}, {hi}]")
+
+        S = S.to(self.hash_targets.device).float()
+        clip = max(float(getattr(args, 'proxy_margin_similarity_clip', 1.0)), 1e-6)
+        S_clamped = S.clamp(min=-clip, max=clip)
+        S01 = ((S_clamped / clip) + 1.0) / 2.0
+        S01 = S01.clamp(0.0, 1.0)
+        dissimilarity = 1.0 - S01
+
+        margin_matrix = lo + dissimilarity * (hi - lo)
+        margin_matrix = margin_matrix.fill_diagonal_(0.0)
+        return margin_matrix.to(self.hash_targets.device)
+
+    def _semantic_margin_proxy_loss(self, u, y):
+        """
+        u: (B, bit) tanh-relaxed codes, values in (-1, 1)
+        y: (B, n_class) one-hot labels
+        Returns a scalar loss, normalized to roughly the same order of magnitude
+        as center_loss/Q_loss.
+        """
+        t = y.argmax(dim=1)
+
+        dot = u @ self.hash_targets.t()
+        d = 0.5 * (self.bit - dot)
+
+        margin = self.margin_matrix[t]
+        hinge = (margin - d).clamp(min=0.0)
+
+        neg_mask = torch.ones_like(hinge)
+        neg_mask.scatter_(1, t.unsqueeze(1), 0.0)
+        hinge = hinge * neg_mask
+
+        denom = max(self.n_class - 1, 1)
+        per_sample = hinge.sum(dim=1) / denom
+        per_sample = per_sample / self.bit
+
+        return per_sample.mean()
 
     # use algorithm 1 to generate hash centers
     def get_hash_targets(self, n_class, bit):
@@ -69,7 +142,7 @@ class CSQLoss(torch.nn.Module):
         return hash_targets
 
 
-def train_val(args, hash_center, train_loader, test_loader, database_loader, num_database):
+def train_val(args, hash_center, S, train_loader, test_loader, database_loader, num_database):
     print('==========start to train SHC NetWork==========')
     bit = args.code_length
     net = args.net(bit).to(args.device)
@@ -82,7 +155,7 @@ def train_val(args, hash_center, train_loader, test_loader, database_loader, num
         hash_center = hash_center.t()  # n_class * bit
 
 
-    criterion = CSQLoss(args, bit, hash_center)
+    criterion = CSQLoss(args, bit, hash_center, S)
 
     result_dic = {}
     Best_mAP_ALL = 0

@@ -62,6 +62,20 @@ def load_config():
     parser.add_argument('--vl-image-text-ratio', default=0.5, type=float,
                         help='Fraction of the vision-language weight assigned to CLIP image similarity '
                              '(the remainder goes to CLIP text similarity).(default: 0.5)')
+    parser.add_argument('--use-semantic-margin-proxy-loss', action='store_true',
+                        help='Enable an opt-in proxy-anchor-style negative hinge term in Stage 3 that pushes '
+                             'each sample away from every OTHER class hash center, using a per-class-pair margin '
+                             'that is smaller for semantically similar classes and larger for dissimilar classes '
+                             '(derived from the Stage-1 similarity matrix S and the Stage-2 get_margin bounds). '
+                             'Default: off (baseline CSQLoss behavior is unchanged).')
+    parser.add_argument('--proxy-margin-weight', default=0.05, type=float,
+                        help='Weight applied to the semantic-margin proxy loss term before adding it to '
+                             'center_loss + lambd*Q_loss. Only used when --use-semantic-margin-proxy-loss is set. '
+                             '(default: 0.05)')
+    parser.add_argument('--proxy-margin-similarity-clip', default=1.0, type=float,
+                        help='Clip bound applied to S before mapping it to a [0,1] dissimilarity used to '
+                             'interpolate between the theoretical d_min/d_max Hamming margins. Only used when '
+                             '--use-semantic-margin-proxy-loss is set. (default: 1.0)')
 
     args = parser.parse_args()
 
@@ -100,4 +114,4 @@ if __name__ == '__main__':
     H = H.to(args.device)
 
     # Stage 3: Train the Deep Hashing Network
-    train_val(args, H, train_loader, test_loader, database_loader, num_database)
+    train_val(args, H, S, train_loader, test_loader, database_loader, num_database)
