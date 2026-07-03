@@ -44,7 +44,7 @@ pip install torch==2.1.2 torchvision==0.16.2 torchaudio==2.1.0 --index-url https
 ```
 
 ## Code Introduction
-- `GenerateSimilarityMatrix.py` is stage1 in SHC, you can easily use it to generate SimilarityMatrix on your own dataset.
+- `GenerateSimilarityMatrix.py` is stage1 in SHC, you can easily use it to generate SimilarityMatrix on your own dataset. It also supports an optional confidence-adaptive fusion with a CLIP-based vision-language prior (see `--use-adaptive-fusion` below).
 - `GenerateSemanticHashCenters.py` is stage2 in SHC, you can generate SemanticHashCenters based on SimilarityMatrix.
 - `network.py` contains all the networks used in SHC, including classification network and hash network. The default is ResNet34. If you need to modify the backbone, you can do so here.
 
@@ -92,6 +92,29 @@ python run.py --dataset NAbirds-official-seg \
   - `--topk`: the topk number of retrieval images
   - `--batch_size`: the number of videos in a batch.
   - `--gpu`: choose the gpu to use.
+
+### Confidence-adaptive vision-language fusion (optional)
+
+Stage 1's classifier-only similarity matrix can be noisy on fine-grained/small-sample datasets (e.g. Stanford Cars-B, NABirds-B). Passing `--use-adaptive-fusion` blends it with a CLIP image/text semantic prior:
+
+```
+S_final = alpha * S_classifier + beta * S_CLIP_image + gamma * S_CLIP_text
+```
+
+`alpha/beta/gamma` are derived per class from the classifier's own confidence on that class (lower confidence -> more weight on the CLIP prior), then averaged pairwise to keep the matrix symmetric. This requires the OpenAI CLIP package:
+```
+pip install git+https://github.com/openai/CLIP.git
+```
+
+  - `--use-adaptive-fusion`: enable the fusion described above (default: off, identical to the original classifier-only matrix).
+  - `--clip-model`: CLIP backbone used to build the vision-language prior (default: `ViT-B/32`).
+  - `--vl-fusion-max-weight`: upper bound on the combined CLIP weight (`beta + gamma`) for the least confident class (default: `0.25`).
+  - `--vl-fusion-min-cls-weight`: lower bound on the classifier weight (`alpha`) for any class (default: `0.70`).
+  - `--vl-image-text-ratio`: how the CLIP weight is split between image and text similarity (default: `0.5`, i.e. even split).
+  - `--vl-similarity-path`: reuse a previously cached CLIP image/text similarity matrix instead of recomputing it.
+  - `--force-rebuild-similarity`: ignore any cached similarity matrix (classifier or CLIP) and regenerate it.
+
+Note: class-name text prompts (for `S_CLIP_text`) are currently only wired up for CIFAR-100; other datasets fall back to placeholder class names until their loaders expose real class names.
 
 ## Precision Recall Curve
 the Precision Recall Curve in SHC is here:

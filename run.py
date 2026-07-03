@@ -4,7 +4,7 @@ import os.path
 import torch
 from network import *
 from data.data_loader import load_data
-from GenerateSimilarityMatrix import GenerateSimilarityMatrix
+from GenerateSimilarityMatrix import GenerateSimilarityMatrix, get_similarity_matrix_path
 from GenerateSemanticHashCenters import GenerateSemanticHashCenters
 from train import train_val
 
@@ -47,6 +47,21 @@ def load_config():
                         help='picture crop size.(default: 224)')
     parser.add_argument('--gpu', default=0, type=int,
                         help='Using gpu.(default: 0)')
+    parser.add_argument('--use-adaptive-fusion', action='store_true',
+                        help='Use confidence-adaptive fusion between SHC similarity and a vision-language prior.')
+    parser.add_argument('--vl-similarity-path', default=None, type=str,
+                        help='Optional path of a precomputed class-level vision-language similarity matrix.')
+    parser.add_argument('--vl-fusion-max-weight', default=0.25, type=float,
+                        help='Maximum weight assigned to the vision-language prior in adaptive fusion.')
+    parser.add_argument('--vl-fusion-min-cls-weight', default=0.70, type=float,
+                        help='Minimum weight retained for the original data-dependent SHC similarity matrix.')
+    parser.add_argument('--force-rebuild-similarity', action='store_true',
+                        help='Regenerate the similarity matrix even when a cached matrix exists.')
+    parser.add_argument('--clip-model', default='ViT-B/32', type=str,
+                        help='CLIP backbone used to build the vision-language prior.(default: ViT-B/32)')
+    parser.add_argument('--vl-image-text-ratio', default=0.5, type=float,
+                        help='Fraction of the vision-language weight assigned to CLIP image similarity '
+                             '(the remainder goes to CLIP text similarity).(default: 0.5)')
 
     args = parser.parse_args()
 
@@ -68,9 +83,10 @@ if __name__ == '__main__':
     train_loader, test_loader, database_loader, num_train, num_test, num_database = load_data(args)
 
     # Stage1：Construct the Data-dependent Pairwise Similarity Matrix
-    if os.path.exists(f'./save/SimilarityMatrix/{args.dataset}_Similarity_Matrix.pt'):
+    similarity_matrix_path = get_similarity_matrix_path(args)
+    if os.path.exists(similarity_matrix_path) and not args.force_rebuild_similarity:
         print('==========SimilarityMatrix has already generated==========')
-        S = torch.load(f'./save/SimilarityMatrix/{args.dataset}_Similarity_Matrix.pt')
+        S = torch.load(similarity_matrix_path)
     else:
         S = GenerateSimilarityMatrix(args, train_loader, test_loader)
     S = S.to(args.device)
