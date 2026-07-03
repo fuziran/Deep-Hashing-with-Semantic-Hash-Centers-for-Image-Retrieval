@@ -5,3 +5,4 @@ __pycache__/
 data/cifar-100-python/
 save/
 *.whl
+data/NABirds-B/

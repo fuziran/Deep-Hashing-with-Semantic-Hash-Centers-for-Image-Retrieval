@@ -112,15 +112,175 @@ class CIFAR100HashDataset(Dataset):
         return img, label, torch.tensor(real_idx, dtype=torch.long)
 
 
+def _resolve_nabirds_root(root):
+    candidates = [root, os.path.join(root, "images")]
+
+    for cand in candidates:
+        if (
+            cand
+            and os.path.exists(os.path.join(cand, "train"))
+            and os.path.exists(os.path.join(cand, "query"))
+            and os.path.exists(os.path.join(cand, "database"))
+        ):
+            return cand
+
+    raise FileNotFoundError(
+        "Cannot find NABirds train/query/database split directories. Please pass --root pointing "
+        "to the 'images' directory (or its parent) that contains train/, query/, database/ subfolders."
+    )
+
+
+_IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".bmp")
+
+
+def _scan_nabirds_split(split_dir):
+    class_names = sorted(
+        d for d in os.listdir(split_dir) if os.path.isdir(os.path.join(split_dir, d))
+    )
+
+    samples = []
+    for cname in class_names:
+        cdir = os.path.join(split_dir, cname)
+        for fname in sorted(os.listdir(cdir)):
+            if fname.lower().endswith(_IMAGE_EXTENSIONS):
+                samples.append((os.path.join(cdir, fname), cname))
+
+    return samples, class_names
+
+
+class NABirdsHashDataset(Dataset):
+    def __init__(self, samples, class_to_idx, num_classes, transform=None):
+        self.samples = samples
+        self.class_to_idx = class_to_idx
+        self.num_classes = num_classes
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, item):
+        path, cname = self.samples[item]
+        img = Image.open(path).convert("RGB")
+        label_id = self.class_to_idx[cname]
+
+        if self.transform is not None:
+            img = self.transform(img)
+
+        label = torch.zeros(self.num_classes, dtype=torch.float32)
+        label[label_id] = 1.0
+
+        return img, label, torch.tensor(item, dtype=torch.long)
+
+
 def load_data(args):
     dataset_name = args.dataset.lower()
 
-    if "cifar" not in dataset_name:
-        raise NotImplementedError(
-            "This patched data_loader currently supports CIFAR-100 only. "
-            "For Stanford Cars/NABirds, please provide their directory/list-file structure first."
+    if "cifar" in dataset_name:
+        return _load_data_cifar100(args)
+    if "nabird" in dataset_name:
+        return _load_data_nabirds(args)
+
+    raise NotImplementedError(
+        "This data_loader currently supports CIFAR-100 and NABirds only. "
+        "For Stanford Cars, please provide its directory/list-file structure first."
+    )
+
+
+def _load_data_nabirds(args):
+    root = _resolve_nabirds_root(args.root)
+
+    train_samples, train_classes = _scan_nabirds_split(os.path.join(root, "train"))
+    query_samples, query_classes = _scan_nabirds_split(os.path.join(root, "query"))
+    database_samples, database_classes = _scan_nabirds_split(os.path.join(root, "database"))
+
+    all_classes = sorted(set(train_classes) | set(query_classes) | set(database_classes))
+    class_to_idx = {c: i for i, c in enumerate(all_classes)}
+
+    if len(all_classes) != args.num_classes:
+        print(
+            f"WARNING: found {len(all_classes)} NABirds classes under {root}, "
+            f"but args.num_classes={args.num_classes}. Pass --num-classes {len(all_classes)}."
         )
 
+    normalize = transforms.Normalize(
+        mean=[0.485, 0.456, 0.406],
+        std=[0.229, 0.224, 0.225],
+    )
+
+    train_transform = transforms.Compose([
+        transforms.Resize(args.resize_size),
+        transforms.RandomCrop(args.crop_size),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        normalize,
+    ])
+
+    test_transform = transforms.Compose([
+        transforms.Resize(args.resize_size),
+        transforms.CenterCrop(args.crop_size),
+        transforms.ToTensor(),
+        normalize,
+    ])
+
+    train_dataset = NABirdsHashDataset(
+        train_samples, class_to_idx,
+        num_classes=args.num_classes,
+        transform=train_transform,
+    )
+    test_dataset = NABirdsHashDataset(
+        query_samples, class_to_idx,
+        num_classes=args.num_classes,
+        transform=test_transform,
+    )
+    database_dataset = NABirdsHashDataset(
+        database_samples, class_to_idx,
+        num_classes=args.num_classes,
+        transform=test_transform,
+    )
+
+    pin_memory = args.device.type == "cuda"
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=pin_memory,
+        drop_last=False,
+    )
+
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=pin_memory,
+        drop_last=False,
+    )
+
+    database_loader = DataLoader(
+        database_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=pin_memory,
+        drop_last=False,
+    )
+
+    print("========== NABirds dataset loaded ==========")
+    print(f"train: {len(train_dataset)}, query: {len(test_dataset)}, database: {len(database_dataset)}")
+
+    return (
+        train_loader,
+        test_loader,
+        database_loader,
+        len(train_dataset),
+        len(test_dataset),
+        len(database_dataset),
+    )
+
+
+def _load_data_cifar100(args):
     images, labels = _load_cifar100_raw(args.root)
     train_idx, query_idx, database_idx = _stratified_split_cifar100(labels, seed=args.seed)
 

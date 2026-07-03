@@ -65,16 +65,16 @@ If you want to create a custom dataset, please follow the data formats of the St
 ## Train
 You can easily train and test SHC just by
 ```
-python run.py --dataset NAbirds-official-seg \
-              --num_classes 100 \
-              --code_length 32 \
+python run.py --dataset NAbirds-B \
+              --num-classes 555 \
+              --root ./data/NABirds-B/NAbirds-new-seg/images \
+              --code-length 32 \
               --lr 1e-4 \
-              --epoch 100 \
-              --classify_epoch 100 \
-              --test_map 5 \
+              --epoch 300 \
+              --classify_epoch 300 \
+              --test-map 5 \
               --beta 1.00 \
               --lambd 1e-4 \
-              --topk 100 \
               --batch-size 64 \
               --gpu 0
 ```
@@ -82,15 +82,16 @@ python run.py --dataset NAbirds-official-seg \
   Options:
   
   - `--dataset`: dataset name
-  - `--num_classes`: number of dataset categories
-  - `--code_length`: code length of hash.
-  - `--lr`: learning rate.
+  - `--num-classes`: number of dataset categories
+  - `--root`: path to the dataset's `images` directory (must contain `train/`, `query/`, `database/` subfolders for NABirds/Stanford Cars, or `cifar-100-python/` for CIFAR-100)
+  - `--code-length`: code length of hash.
+  - `--lr`: learning rate. (7e-5 for CIFAR-100, 1e-4 for other datasets, per the paper's Section 4.4)
   - `--epoch`: training epochs of the hashing network in stage 3.
   - `--classify_epoch`: training epochs of the classification network in stage 1.
   - `--beta`: hyperparameters.
   - `--lambd`: hyperparameters.
-  - `--topk`: the topk number of retrieval images
-  - `--batch_size`: the number of videos in a batch.
+  - `--topK`: the topk number of retrieval images
+  - `--batch-size`: the number of images in a batch.
   - `--gpu`: choose the gpu to use.
 
 ### Confidence-adaptive vision-language fusion (optional)
