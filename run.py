@@ -54,6 +54,12 @@ def load_config():
     parser.add_argument('--alpha-ind', default=0.001, type=float,
                         help='[Innov-2] Bit-independence loss weight (0 = disabled)')
 
+    # ── Innovation 4: Online adaptive hash center refinement ──────────────
+    parser.add_argument('--refine-interval', default=20, type=int,
+                        help='[Innov-4] Epochs between hash-center EMA refinements (0 = disabled)')
+    parser.add_argument('--refine-momentum', default=0.995, type=float,
+                        help='[Innov-4] EMA momentum for center refinement')
+
     args = parser.parse_args()
 
     # GPU

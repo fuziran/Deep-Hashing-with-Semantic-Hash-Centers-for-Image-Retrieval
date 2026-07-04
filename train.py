@@ -91,6 +91,66 @@ class CSQLoss(torch.nn.Module):
         return hash_targets
 
 
+# =============================================================================
+# Innovation 4: Online adaptive hash center refinement (EMA)
+# =============================================================================
+
+class AdaptiveHashCenter:
+    """Tracks per-class hash-code centroids and periodically refines the
+    target hash centers via Exponential Moving Average (EMA).
+
+    The motivation: hash centers are generated offline from the classification
+    feature space (stage 2). As the hashing network trains, its feature
+    manifold gradually diverges from the classifier's manifold, widening the
+    gap between the fixed centers and the actual learned distribution.
+    EMA refinement closes this gap without discarding the distance-optimal
+    layout produced by the ADMM solver.
+    """
+
+    def __init__(self, hash_center, num_classes, momentum=0.995):
+        self.centers = hash_center.clone().float().cpu()   # [n_class, bit]
+        self.momentum = momentum
+        self.num_classes = num_classes
+        self.bit = hash_center.size(1)
+        self._reset_accum()
+
+    def _reset_accum(self):
+        self.class_sums = torch.zeros(self.num_classes, self.bit)
+        self.class_counts = torch.zeros(self.num_classes)
+
+    def update(self, hash_codes, labels):
+        """Accumulate batch statistics (called every training step)."""
+        with torch.no_grad():
+            codes = hash_codes.tanh().detach().cpu()     # [B, bit]
+            c_ids = labels.argmax(dim=1).cpu()           # [B]
+            for i, c in enumerate(c_ids):
+                self.class_sums[c] += codes[i]
+                self.class_counts[c] += 1
+
+    def refine(self):
+        """EMA-update centers from accumulated epoch statistics.
+
+        Returns the new hash-center tensor (binarised ±1).
+        """
+        with torch.no_grad():
+            valid = self.class_counts > 0
+            if valid.sum() == 0:
+                return self.centers
+
+            epoch_mean = self.class_sums[valid] / self.class_counts[valid].unsqueeze(1)
+            self.centers[valid] = (
+                self.momentum * self.centers[valid]
+                + (1.0 - self.momentum) * epoch_mean
+            )
+            # Binarise: keep centers in {-1, +1}
+            new_centers = torch.sign(self.centers)
+            new_centers[new_centers == 0] = 1.0
+            self.centers = new_centers.clone()
+
+        self._reset_accum()
+        return self.centers
+
+
 def train_val(args, hash_center, train_loader, test_loader, database_loader, num_database):
     print('==========start to train SHC NetWork==========')
     bit = args.code_length
@@ -105,6 +165,16 @@ def train_val(args, hash_center, train_loader, test_loader, database_loader, num
 
 
     criterion = CSQLoss(args, bit, hash_center)
+
+    # ── Innovation 4: online center refinement setup ───────────────────────
+    refine_interval = getattr(args, 'refine_interval', 0)
+    refine_momentum = getattr(args, 'refine_momentum', 0.995)
+    use_center_refine = refine_interval > 0
+    if use_center_refine:
+        adaptive_center = AdaptiveHashCenter(
+            hash_center, args.num_classes, momentum=refine_momentum
+        )
+        warmup_epochs = args.epoch // 4   # refine only after 25% of training
 
     result_dic = {}
     Best_mAP_ALL = 0
@@ -146,6 +216,10 @@ def train_val(args, hash_center, train_loader, test_loader, database_loader, num
             # torch.nn.utils.clip_grad_norm_(net.parameters(), 5.0)
             optimizer.step()
 
+            # Accumulate statistics for Innovation 4
+            if use_center_refine:
+                adaptive_center.update(u, label)
+
         scheduler.step()
 
         train_loss = train_loss / len(train_loader)
@@ -153,6 +227,12 @@ def train_val(args, hash_center, train_loader, test_loader, database_loader, num
         loss_list.append(train_loss)
 
         print("\b\b\b\b\b\b\b loss:%.5f" % (train_loss))
+
+        # ── Innovation 4: periodic EMA center refinement ──────────────────
+        if use_center_refine and (epoch + 1) % refine_interval == 0 and epoch >= warmup_epochs:
+            new_centers = adaptive_center.refine().to(args.device)
+            criterion.hash_targets = new_centers
+            print(f"  [Innov-4] Hash centers refined at epoch {epoch + 1}.")
 
         if (epoch + 1) % args.test_map == 0:
             net.eval()
