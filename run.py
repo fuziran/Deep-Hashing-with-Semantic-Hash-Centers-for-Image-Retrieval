@@ -54,6 +54,16 @@ def load_config():
     parser.add_argument('--alpha-ind', default=0.001, type=float,
                         help='[Innov-2] Bit-independence loss weight (0 = disabled)')
 
+    # ── Innovation 5: Semantic diffusion similarity matrix ────────────────
+    parser.add_argument('--use-diffusion', default=True, type=lambda x: x.lower() != 'false',
+                        help='[Innov-5] Enable high-order semantic diffusion (default: True)')
+    parser.add_argument('--diff-alpha', default=0.15, type=float,
+                        help='[Innov-5] Diffusion decay factor')
+    parser.add_argument('--diff-steps', default=3, type=int,
+                        help='[Innov-5] Number of diffusion hops')
+    parser.add_argument('--sim-topk', default=0, type=int,
+                        help='[Innov-5] Top-K neighbours per class (0 = auto: max(10, n//10))')
+
     args = parser.parse_args()
 
     # GPU
@@ -61,6 +71,10 @@ def load_config():
         args.device = torch.device("cpu")
     else:
         args.device = torch.device("cuda:%d" % args.gpu)
+
+    # Auto sim_topk
+    if args.sim_topk == 0:
+        args.sim_topk = max(10, args.num_classes // 10)
 
     # net
     args.net = ResNet
@@ -74,11 +88,20 @@ if __name__ == '__main__':
     train_loader, test_loader, database_loader, num_train, num_test, num_database = load_data(args)
 
     # Stage1：Construct the Data-dependent Pairwise Similarity Matrix
-    if os.path.exists(f'./save/SimilarityMatrix/{args.dataset}_Similarity_Matrix.pt'):
+    # Cache filename encodes diffusion params so any change triggers regeneration.
+    if args.use_diffusion:
+        _sim_suffix = f'_diff_a{args.diff_alpha}_s{args.diff_steps}_k{args.sim_topk}'
+    else:
+        _sim_suffix = '_nodiff'
+    _sim_path = f'./save/SimilarityMatrix/{args.dataset}_Similarity_Matrix{_sim_suffix}.pt'
+
+    if os.path.exists(_sim_path):
         print('==========SimilarityMatrix has already generated==========')
-        S = torch.load(f'./save/SimilarityMatrix/{args.dataset}_Similarity_Matrix.pt')
+        S = torch.load(_sim_path)
     else:
         S = GenerateSimilarityMatrix(args, train_loader, test_loader)
+        os.makedirs('./save/SimilarityMatrix/', exist_ok=True)
+        torch.save(S, _sim_path)
     S = S.to(args.device)
 
     # Stage 2: Generate the Semantic Hash Centers

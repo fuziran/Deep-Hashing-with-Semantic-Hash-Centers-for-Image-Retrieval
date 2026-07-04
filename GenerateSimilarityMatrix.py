@@ -1,4 +1,5 @@
 import os.path
+import torch
 import torch.nn.functional as F
 import torch.optim as optim
 import torch.optim.lr_scheduler as lr_scheduler
@@ -6,6 +7,54 @@ import time
 from utils.tools import *
 from network import *
 from loguru import logger
+
+
+def _high_order_diffusion(S, alpha=0.15, steps=3):
+    """Graph diffusion to propagate transitive semantic relations.
+
+    S_diffused = sum_{k=0}^{steps} alpha^k * T^k
+    where T is the row-normalised off-diagonal similarity (random-walk matrix).
+    """
+    device = S.device
+    n = S.size(0)
+
+    S_off = S.clone()
+    S_off.fill_diagonal_(0.0)
+
+    row_sum = S_off.sum(dim=1, keepdim=True).clamp(min=1e-8)
+    T = S_off / row_sum
+
+    S_diffused = torch.eye(n, device=device)
+    T_power = T.clone()
+    coeff = alpha
+    for _ in range(steps):
+        S_diffused = S_diffused + coeff * T_power
+        T_power = T_power @ T
+        coeff = coeff * alpha
+
+    S_diffused = (S_diffused + S_diffused.T) / 2.0
+    S_diffused.fill_diagonal_(1.0)
+
+    S_final = 0.7 * S + 0.3 * S_diffused
+    S_final.fill_diagonal_(1.0)
+    return S_final
+
+
+def _sparse_topk_similarity(S, topk):
+    """Keep only top-k neighbours per class; zero-out weak similarities."""
+    n = S.size(0)
+    S_sparse = torch.zeros_like(S)
+    for i in range(n):
+        row = S[i].clone()
+        row[i] = float('-inf')
+        vals, idx = torch.topk(row, k=min(topk, n - 1))
+        mask = vals > 0
+        S_sparse[i, idx[mask]] = vals[mask]
+
+    S_sparse = (S_sparse + S_sparse.T) / 2.0
+    S_sparse.fill_diagonal_(1.0)
+    return S_sparse
+
 
 def TrainClassificationNetwork(args, train_loader, test_loader):
     print('==========start to generate ClassificationNetwork==========')
@@ -100,7 +149,7 @@ def GenerateSimilarityMatrix(args, train_loader, test_loader):
                 tmp[true_targets[i]] = float('-inf') # 对最大值做mask（变成-INF）
                 S[true_targets[i]] += F.softmax(tmp)
 
-    mask = torch.eye(args.num_classes).bool()
+    mask = torch.eye(args.num_classes).bool().to(args.device)
     S = (S + S.T) / 2
     for i in range(args.num_classes):
         S_max = S[i].max()
@@ -108,7 +157,25 @@ def GenerateSimilarityMatrix(args, train_loader, test_loader):
         S_mean = S[i].mean()
         S[i] = (S[i] - S_mean) / max(abs(S_max - S_mean), abs(S_min - S_mean))
     S[mask] = 1
-    os.makedirs(f'./save/SimilarityMatrix/', exist_ok=True)
-    torch.save(S, f'./save/SimilarityMatrix/{args.dataset}_Similarity_Matrix.pt')
+
+    # ------------------------------------------------------------------
+    # Innovation 5: high-order semantic diffusion + top-k sparsification
+    # ------------------------------------------------------------------
+    use_diffusion = getattr(args, 'use_diffusion', True)
+    if use_diffusion:
+        diff_alpha = getattr(args, 'diff_alpha', 0.15)
+        diff_steps = getattr(args, 'diff_steps', 3)
+        topk_neighbours = getattr(args, 'sim_topk', max(10, args.num_classes // 10))
+
+        print(f'[Innovation 5] Applying semantic diffusion: alpha={diff_alpha}, steps={diff_steps}')
+        S = _high_order_diffusion(S, alpha=diff_alpha, steps=diff_steps)
+
+        print(f'[Innovation 5] Applying top-k sparsification: k={topk_neighbours}')
+        S = _sparse_topk_similarity(S, topk=topk_neighbours)
+
+        print(f'[Innovation 5] S stats after diffusion — '
+              f'min={S[~mask].min():.4f}, max={S[~mask].max():.4f}, '
+              f'mean={S[~mask].mean():.4f}')
+
     print('==========success generate SimilarityMatrix==========')
     return S
