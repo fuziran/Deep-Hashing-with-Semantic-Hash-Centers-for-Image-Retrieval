@@ -3,6 +3,7 @@ __pycache__/
 *.pyc
 
 data/cifar-100-python/
+data/NABirds-B/
 save/
 *.whl
 
