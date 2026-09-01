@@ -63,6 +63,35 @@ We have utilized six datasets: CIFAR-100, Stanford Cars-A, Stanford Cars-B, NABi
 If you want to create a custom dataset, please follow the data formats of the Stanford Cars and NABirds datasets.
 
 ## Train
+
+### Audited B0 baseline (CIFAR-100)
+
+The main B0 protocol reserves 10 images per class from the 10,000-image
+training pool for validation. The 5,000-image query set is used only once for
+the final evaluation. Run the CPU-only unit tests before using the GPU:
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+Run a one-epoch smoke test first:
+
+```bash
+python3 run.py --dataset cifar-100-new-seg \
+  --root ./data/cifar-100-python \
+  --num-classes 100 --code-length 32 --seed 60 \
+  --classify-epoch 1 --epoch 1 --test-map 1 \
+  --batch-size 64 --num-workers 4 --topK -1 100 1000
+```
+
+For the reported B0 result, restore both epoch counts to 300. Splits, cache
+metadata, the selected checkpoint, all three mAP values, per-query AP and
+binary codes are written under `save/`. Use `--stage similarity` or
+`--stage centers` to stop after a diagnostic stage, and use
+`--force-recompute` only when intentionally replacing a matching cache.
+
+### Legacy command
+
 You can easily train and test SHC just by
 ```
 python run.py --dataset NAbirds-official-seg \

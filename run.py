@@ -1,87 +1,130 @@
 import argparse
-import os.path
+import os
 
 import torch
-from network import *
-from data.data_loader import load_data
-from GenerateSimilarityMatrix import GenerateSimilarityMatrix
+
 from GenerateSemanticHashCenters import GenerateSemanticHashCenters
+from GenerateSimilarityMatrix import GenerateSimilarityMatrix
+from data.data_loader import load_data
+from network import ResNet
 from train import train_val
+from utils.experiment import (
+    current_git_commit,
+    seed_everything,
+    stable_config_hash,
+    write_run_manifest,
+)
 
 
 def load_config():
-    parser = argparse.ArgumentParser(description='SHC_PyTorch')
-    parser.add_argument('--seed', default=60, type=int,
-                        help='seed')
-    parser.add_argument('--info', default='[SHC]', type=str,
-                        help='information')
-    parser.add_argument('--dataset', default='cifar-100-new-seg', type=str,
-                        help='Dataset name.(default: cifar-100-new-seg, stanford_cars-new-seg, stanford_cars-official-seg, NAbirds-new-seg, NAbirds-official-seg,')
-    parser.add_argument('--num-classes', default=100, type=int,
-                        help='num classes of dataset.(default: 100)')
-    parser.add_argument('--root', default='../data/cifar/cifar-100/cifar-100-new-seg/', type=str,
-                        help='Path of dataset')
-    parser.add_argument('--code-length', default=32, type=int,
-                        help='Binary hash code length.(default: 32)')
-    parser.add_argument('--lr', default=7e-5, type=float,
-                        help='Learning rate.(default: 7e-5 for CIFAR-100, 1e-4 for other datasets)')
-    parser.add_argument('--epoch', default=300, type=int,
-                        help='max epoch.(default: 300)')
-    parser.add_argument('--classify_epoch', default=300, type=int,
-                        help='max epoch for classification.(default: 300)')
-    parser.add_argument('--test-map', default=5, type=int,
-                        help='test frequency.(default: 10)')
-    parser.add_argument('--beta', default=1.00, type=float,
-                        help='para')
-    parser.add_argument('--lambd', default=0.0001, type=float,
-                        help='para')
-    parser.add_argument('--topK', default=[-1, 100, 1000], type=int,
-                        help='Calculate map of top k.(default: all)')
-    parser.add_argument('--batch-size', default=64, type=int,
-                        help='Batch size.(default: 128)')
-    parser.add_argument('--num-workers', default=6, type=int,
-                        help='Number of loading data threads.(default: 6)')
-    parser.add_argument('--resize-size', default=256, type=int,
-                        help='picture resize size.(default: 256)')
-    parser.add_argument('--crop-size', default=224, type=int,
-                        help='picture crop size.(default: 224)')
-    parser.add_argument('--gpu', default=0, type=int,
-                        help='Using gpu.(default: 0)')
-
+    parser = argparse.ArgumentParser(description="Faithful and auditable SHC B0 baseline")
+    parser.add_argument("--seed", default=60, type=int)
+    parser.add_argument("--info", default="[SHC-B0]", type=str)
+    parser.add_argument("--dataset", default="cifar-100-new-seg", type=str)
+    parser.add_argument("--num-classes", default=100, type=int)
+    parser.add_argument("--root", default="./data/cifar-100-python", type=str)
+    parser.add_argument("--code-length", default=32, type=int)
+    parser.add_argument("--lr", default=7e-5, type=float)
+    parser.add_argument("--epoch", default=300, type=int)
+    parser.add_argument("--classify-epoch", "--classify_epoch", default=300, type=int)
+    parser.add_argument("--test-map", "--test_map", default=5, type=int)
+    parser.add_argument("--beta", default=1.0, type=float)
+    parser.add_argument("--lambd", default=1e-4, type=float)
+    parser.add_argument("--topK", nargs="+", default=[-1, 100, 1000], type=int)
+    parser.add_argument("--batch-size", default=64, type=int)
+    parser.add_argument("--num-workers", default=6, type=int)
+    parser.add_argument("--resize-size", default=256, type=int)
+    parser.add_argument("--crop-size", default=224, type=int)
+    parser.add_argument("--gpu", default=0, type=int)
+    parser.add_argument("--cpu", action="store_true")
+    parser.add_argument("--val-per-class", default=10, type=int)
+    parser.add_argument(
+        "--mask-strategy",
+        choices=("predicted_argmax", "ground_truth"),
+        default="predicted_argmax",
+        help="Paper-formula protocol or released-code protocol for Stage 1 masking.",
+    )
+    parser.add_argument(
+        "--stage",
+        choices=("all", "similarity", "centers", "train"),
+        default="all",
+    )
+    parser.add_argument("--output-dir", default="./save", type=str)
+    parser.add_argument("--force-recompute", action="store_true")
+    parser.add_argument(
+        "--non-deterministic",
+        action="store_true",
+        help="Disable deterministic algorithms; not recommended for reported B0 runs.",
+    )
     args = parser.parse_args()
 
-    # GPU
-    if args.gpu is None:
+    if len(args.topK) != 3:
+        parser.error("--topK must contain exactly: -1 100 1000")
+    if args.topK != [-1, 100, 1000]:
+        parser.error("B0 reporting order is fixed to --topK -1 100 1000")
+    if args.cpu:
         args.device = torch.device("cpu")
     else:
-        args.device = torch.device("cuda:%d" % args.gpu)
-
-    # net
+        if not torch.cuda.is_available():
+            parser.error("CUDA is unavailable; pass --cpu only for diagnostics")
+        args.device = torch.device(f"cuda:{args.gpu}")
     args.net = ResNet
-
+    args.git_commit = current_git_commit()
     return args
 
 
-if __name__ == '__main__':
+def main():
     args = load_config()
-    # load data
-    train_loader, test_loader, database_loader, num_train, num_test, num_database = load_data(args)
+    seed_everything(args.seed, deterministic=not args.non_deterministic)
 
-    # Stage1：Construct the Data-dependent Pairwise Similarity Matrix
-    if os.path.exists(f'./save/SimilarityMatrix/{args.dataset}_Similarity_Matrix.pt'):
-        print('==========SimilarityMatrix has already generated==========')
-        S = torch.load(f'./save/SimilarityMatrix/{args.dataset}_Similarity_Matrix.pt')
-    else:
-        S = GenerateSimilarityMatrix(args, train_loader, test_loader)
-    S = S.to(args.device)
+    (
+        train_loader,
+        relation_loader,
+        val_loader,
+        query_loader,
+        database_loader,
+        _,
+        _,
+        _,
+        num_database,
+    ) = load_data(args)
 
-    # Stage 2: Generate the Semantic Hash Centers
-    if os.path.exists(f'./save/HashCenters/{args.dataset}_SHC_HashCenters_bit_{args.code_length}.pt'):
-        print('==========SHC HashCenters has already generated==========')
-        H = torch.load(f'./save/HashCenters/{args.dataset}_SHC_HashCenters_bit_{args.code_length}.pt')
-    else:
-        H = GenerateSemanticHashCenters(args, S)
-    H = H.to(args.device)
+    run_config = {
+        "dataset": args.dataset,
+        "seed": args.seed,
+        "split_sha256": args.split_hash,
+        "code_length": args.code_length,
+        "mask_strategy": args.mask_strategy,
+        "git_commit": args.git_commit,
+    }
+    args.run_id = stable_config_hash(run_config)
+    args.run_dir = os.path.join(
+        args.output_dir,
+        "runs",
+        f"{args.dataset}_B0_{args.code_length}bit_seed{args.seed}_{args.run_id}",
+    )
+    write_run_manifest(args)
 
-    # Stage 3: Train the Deep Hashing Network
-    train_val(args, H, train_loader, test_loader, database_loader, num_database)
+    similarity = GenerateSimilarityMatrix(
+        args, train_loader, relation_loader, val_loader
+    )
+    if args.stage == "similarity":
+        return
+
+    centers = GenerateSemanticHashCenters(args, similarity.to(args.device))
+    if args.stage == "centers":
+        return
+
+    train_val(
+        args,
+        centers,
+        train_loader,
+        val_loader,
+        query_loader,
+        database_loader,
+        num_database,
+    )
+
+
+if __name__ == "__main__":
+    main()

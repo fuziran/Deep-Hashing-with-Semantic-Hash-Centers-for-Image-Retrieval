@@ -6,16 +6,13 @@ import numpy as np
 from scipy.special import comb
 import copy
 import time
+from utils.experiment import build_cache_metadata, load_cache, save_cache
 
 
 # np.random.seed(4)
 # random.seed(4)
 # torch.manual_seed(4)
 
-if torch.cuda.is_available():
-    device = torch.device("cuda:0")
-else:
-    device = torch.device("cpu")
 def get_margin(bit, n_class):
     # 1. 计算d_max
     L = bit
@@ -68,7 +65,7 @@ def CSQ_init(n_class, bit):
                 hash_center[index] = ones
             c = []
             for i in range(n_class):
-                for j in range(i, n_class):
+                for j in range(i + 1, n_class):
                     c.append(sum(hash_center[i] != hash_center[j]))
             c = np.array(c)
             if c.min() > bit / 4 and c.mean() >= bit / 2:
@@ -126,7 +123,7 @@ def in_range(z1, z2, z3, bit):
     """
     flag = True
     for item in z1:
-        if item < -1 and item > 1:
+        if item < -1 or item > 1:
             flag = False
             return flag
     for item in z3:
@@ -269,7 +266,34 @@ def GetRawHashCenter(bit, n_class):
     else:
         return init_hash(n_class, bit)
 
+
+def pair_quadratic_gradient(h_i, h_j):
+    """Return 2 * (h_j h_j^T) h_i without collapsing it to ||h_j||² h_i."""
+    return 2 * h_j * torch.dot(h_j, h_i)
+
+
+def pairwise_hamming_distances(centers):
+    """Return unique off-diagonal Hamming distances for q x C centers."""
+    bit, num_classes = centers.shape
+    distance_matrix = (bit - centers.T @ centers) / 2
+    mask = torch.triu(
+        torch.ones(num_classes, num_classes, dtype=torch.bool, device=centers.device),
+        diagonal=1,
+    )
+    return distance_matrix[mask]
+
 def GetMinimalDistanceHashCenter(args):
+    metadata = build_cache_metadata(args, "mds")
+    cache_path = os.path.join(
+        args.output_dir,
+        "HashCenters",
+        f"{args.dataset}_MDS_{metadata['config_hash']}.pt",
+    )
+    if not args.force_recompute:
+        cached = load_cache(cache_path, metadata)
+        if cached is not None:
+            print(f"Loaded audited MDS center cache: {cache_path}")
+            return cached
     print('==========start to generate MDS HashCenters==========')
     bit = args.code_length
     n_class = args.num_classes
@@ -284,8 +308,8 @@ def GetMinimalDistanceHashCenter(args):
     gamma = (1 + 5 ** 0.5) / 2
     error = 1e-6
     # 初始化哈希中心
-    random.seed(40)
-    np.random.seed(40)
+    random.seed(args.seed)
+    np.random.seed(args.seed)
     d = bit - 2 * d_max
     if initWithCSQ:
         B = CSQ_init(n_class, bit)  # initialize with CSQ
@@ -311,26 +335,34 @@ def GetMinimalDistanceHashCenter(args):
     ev_st, ev_mean, ev_min, ev_var, ev_max = cal_hamm(best_B)
     print(
         f"ev_st is {ev_st}, ev_min is {str(ev_min)}, ev_mean is {ev_mean}, ev_var is {ev_var}, ev_max is {str(ev_max)}")
-    os.makedirs("./save/HashCenters", exist_ok=True)
-    torch.save(best_B, f'./save/HashCenters/{args.dataset}_MDS_HashCenters_bit_{args.code_length}.pt')
+    save_cache(cache_path, best_B, metadata)
     print('==========success generate MDS HashCenters==========')
     return best_B
 
 def GenerateSemanticHashCenters(args, S):
 
+    metadata = build_cache_metadata(args, "centers")
+    cache_path = os.path.join(
+        args.output_dir,
+        "HashCenters",
+        f"{args.dataset}_SHC_{metadata['config_hash']}.pt",
+    )
+    if not args.force_recompute:
+        cached = load_cache(cache_path, metadata)
+        if cached is not None:
+            print(f"Loaded audited SHC center cache: {cache_path}")
+            return cached
+
     d, _ = get_margin(args.code_length, args.num_classes)
     print('min_d is: ', d)
 
     S = S.to(args.device)
-    if os.path.exists(f'./save/HashCenters/{args.dataset}_MDS_HashCenters_bit_{args.code_length}.pt'):
-        print('==========MDS HashCenters has already generated==========')
-        H = torch.load(f'./save/HashCenters/{args.dataset}_MDS_HashCenters_bit_{args.code_length}.pt')
-    else:
-        H = GetMinimalDistanceHashCenter(args)
+    H = GetMinimalDistanceHashCenter(args)
     print('==========start to generate SHC HashCenters==========')
     H = torch.from_numpy(H).to(torch.float32)
     if H.shape != (args.code_length, args.num_classes):
         H = H.T
+    device = args.device
     H = H.to(device)  # q * c
 
     K = torch.zeros(args.num_classes, args.num_classes)
@@ -342,14 +374,18 @@ def GenerateSemanticHashCenters(args, S):
             else:
                 K[i, j] = args.code_length - 2 * d - H[:, i].T @ H[:, j]
 
-    lambd =  torch.full((args.code_length, args.num_classes), 0)
-    lambd = lambd.to(device)
+    lambd = torch.zeros(
+        args.code_length, args.num_classes, device=device, dtype=torch.float32
+    )
     rho = 0.2
     miu = 0.625
-    alpha = torch.full((args.num_classes, args.num_classes), 0)   # 0
-    alpha = alpha.to(device)
-    beta = torch.full((args.num_classes, args.num_classes), 1e-6)   # 1e-6
-    beta = beta.to(device)
+    alpha = torch.zeros(
+        args.num_classes, args.num_classes, device=device, dtype=torch.float32
+    )
+    beta = torch.full(
+        (args.num_classes, args.num_classes), 1e-6,
+        device=device, dtype=torch.float32,
+    )
     eta = 0.5  # 不同数据集这个参数影响挺大的，可以多调调
     print('eta: ', eta)
     epochs = 20
@@ -365,10 +401,9 @@ def GenerateSemanticHashCenters(args, S):
                 continue
             else:
                 loss2 += H[:, i].T @ H[:, j]
-    gen_S = H.T @ H
-    gen_S = (1 - torch.eye(args.num_classes).to(device)) * gen_S
-    gen_min_d = torch.min((args.code_length - gen_S) / 2)
-    gen_max_d = torch.max((args.code_length - gen_S) / 2)
+    hamming_distances = pairwise_hamming_distances(H)
+    gen_min_d = hamming_distances.min()
+    gen_max_d = hamming_distances.max()
     print('raw')
     print('loss1: ', loss1)
     print('loss2: ', loss2.item())
@@ -393,14 +428,22 @@ def GenerateSemanticHashCenters(args, S):
                     if j == i:
                         continue
                     else:
-                        sum += 2 * miu * H[:, j] - 2 * alpha[i, j] * H[:, j] + beta[i, j] * (2 * H[:, j] @ H[:, j].T * H[:, i] - 2 * (args.code_length - 2 * d - K[i, j]) * H[:, j])
+                        sum += (
+                            2 * miu * H[:, j]
+                            - 2 * alpha[i, j] * H[:, j]
+                            + beta[i, j]
+                            * (
+                                pair_quadratic_gradient(H[:, i], H[:, j])
+                                - 2
+                                * (args.code_length - 2 * d - K[i, j])
+                                * H[:, j]
+                            )
+                        )
                 der = (2 / (args.code_length ** 2) * M @ M.T @ H[:, i] - 2 / args.code_length * M @ S[:, i]) + lambd[:, i].T + rho * (H[:, i] - M[:, i]) + sum
 
                 H_tmp = H.clone()
                 H_tmp[:, i] = torch.sign(H_tmp[:, i] - 1 / eta * der)
-                gen_S_tmp = H_tmp.T @ H_tmp
-                gen_S_tmp = (1 - torch.eye(args.num_classes).to(device)) * gen_S_tmp
-                if torch.min((args.code_length - gen_S_tmp) / 2) < d:
+                if pairwise_hamming_distances(H_tmp).min() < d:
                     continue
                 else:
                     H[:, i] = H_tmp[:, i]
@@ -423,10 +466,9 @@ def GenerateSemanticHashCenters(args, S):
                     continue
                 else:
                     loss2 += H[:, i].T @ H[:, j]
-        gen_S = H.T @ H
-        gen_S = (1 - torch.eye(args.num_classes).to(device)) * gen_S
-        gen_min_d = torch.min((args.code_length - gen_S) / 2)
-        gen_max_d = torch.max((args.code_length - gen_S) / 2)
+        hamming_distances = pairwise_hamming_distances(H)
+        gen_min_d = hamming_distances.min()
+        gen_max_d = hamming_distances.max()
         print('epoch: ', epoch)
         print('loss1: ', loss1)
         print('loss2: ', loss2.item())
@@ -439,20 +481,29 @@ def GenerateSemanticHashCenters(args, S):
     H = best_H
     H = H.to('cpu')
     S = S.to('cpu')
-    gen_S = H.T @ H
-    gen_S = (1 - torch.eye(args.num_classes)) * gen_S
-    gen_min_d = torch.min((args.code_length - gen_S) / 2)
-    gen_max_d = torch.max((args.code_length - gen_S) / 2)
-    gen_var_d = torch.var((args.code_length - gen_S) / 2)
+    hamming_distances = pairwise_hamming_distances(H)
+    gen_min_d = hamming_distances.min()
+    gen_max_d = hamming_distances.max()
+    gen_var_d = hamming_distances.var()
     similarity_match = ((S - 1 / args.code_length * H.T @ H) ** 2).mean()
-    mean_hamming_distance = torch.mean((args.code_length - gen_S) / 2)
-    min_d_fre = torch.sum(torch.eq((args.code_length - gen_S) / 2, gen_min_d))
+    mean_hamming_distance = hamming_distances.mean()
+    min_d_fre = torch.sum(torch.eq(hamming_distances, gen_min_d))
     print('gen_min_d: ', gen_min_d.item())
     print('gen_max_d: ', gen_max_d.item())
     print('gen_var_d: ', gen_var_d.item())
     print('similarity_match: ', similarity_match.item())
     print('mean_hamming_distance: ', mean_hamming_distance.item())
-    print('min_d_fre: ', min_d_fre.item() / 2)
-    torch.save(H, f'./save/HashCenters/{args.dataset}_SHC_HashCenters_bit_{args.code_length}.pt')
+    print('min_d_fre: ', min_d_fre.item())
+    save_cache(cache_path, H, metadata)
+    torch.save(
+        {
+            "min_hamming_distance": gen_min_d,
+            "max_hamming_distance": gen_max_d,
+            "hamming_variance": gen_var_d,
+            "similarity_loss": similarity_match,
+            "mean_hamming_distance": mean_hamming_distance,
+        },
+        os.path.join(args.run_dir, "stage2_diagnostics.pt"),
+    )
     print('==========success generate SHC HashCenters==========')
     return H

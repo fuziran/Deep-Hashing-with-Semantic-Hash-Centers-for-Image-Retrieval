@@ -32,7 +32,7 @@ def compute_result(dataloader, net, device):
     return torch.cat(binary_list, dim=0), torch.cat(label_list, dim=0)
 
 
-def _calc_map_for_one_topk(query_binary, query_label, retrieval_binary, retrieval_label, topk):
+def _calc_ap_per_query(query_binary, query_label, retrieval_binary, retrieval_label, topk):
     num_query = query_label.shape[0]
     num_retrieval = retrieval_label.shape[0]
     bit = query_binary.shape[1]
@@ -40,8 +40,7 @@ def _calc_map_for_one_topk(query_binary, query_label, retrieval_binary, retrieva
     if topk == -1 or topk is None or topk > num_retrieval:
         topk = num_retrieval
 
-    total_map = 0.0
-    valid_query = 0
+    per_query = np.full(num_query, np.nan, dtype=np.float64)
 
     retrieval_binary_t = retrieval_binary.T
 
@@ -53,22 +52,29 @@ def _calc_map_for_one_topk(query_binary, query_label, retrieval_binary, retrieva
             continue
 
         hamm = 0.5 * (bit - np.dot(query_binary[i], retrieval_binary_t))
-        ind = np.argsort(hamm)[:topk]
+        ind = np.argsort(hamm, kind="stable")[:topk]
         gnd = gnd[ind]
 
         relevant_positions = np.where(gnd == 1)[0] + 1
         if len(relevant_positions) == 0:
-            valid_query += 1
+            per_query[i] = 0.0
             continue
 
         precision_at_relevant = np.arange(1, len(relevant_positions) + 1) / relevant_positions
-        total_map += precision_at_relevant.mean()
-        valid_query += 1
+        per_query[i] = precision_at_relevant.mean()
 
-    if valid_query == 0:
+    return per_query
+
+
+def _calc_map_for_one_topk(query_binary, query_label, retrieval_binary, retrieval_label, topk):
+    per_query = _calc_ap_per_query(
+        query_binary, query_label, retrieval_binary, retrieval_label, topk
+    )
+    valid = np.isfinite(per_query)
+
+    if not valid.any():
         return 0.0
-
-    return total_map / valid_query
+    return float(per_query[valid].mean())
 
 
 def _calc_pr_curve(query_binary, query_label, retrieval_binary, retrieval_label, num_database):
@@ -95,7 +101,7 @@ def _calc_pr_curve(query_binary, query_label, retrieval_binary, retrieval_label,
             continue
 
         hamm = 0.5 * (bit - np.dot(query_binary[i], retrieval_binary_t))
-        ind = np.argsort(hamm)[:max_k]
+        ind = np.argsort(hamm, kind="stable")[:max_k]
         gnd_sorted = gnd_all[ind]
         cumsum = np.cumsum(gnd_sorted)
 
@@ -186,3 +192,21 @@ def CalcTopMap(retrieval_binary, query_binary, retrieval_label, query_label, top
         )
         for k in topk_list
     ]
+
+
+def CalcTopMapPerQuery(query_binary, query_label, retrieval_binary, retrieval_label, topK):
+    """Return one AP vector per requested cutoff for audit and paired statistics."""
+    if isinstance(topK, int):
+        topk_list = [topK]
+    else:
+        topk_list = list(topK)
+    return {
+        str(k): _calc_ap_per_query(
+            np.asarray(query_binary, dtype=np.float32),
+            np.asarray(query_label, dtype=np.float32),
+            np.asarray(retrieval_binary, dtype=np.float32),
+            np.asarray(retrieval_label, dtype=np.float32),
+            k,
+        )
+        for k in topk_list
+    }

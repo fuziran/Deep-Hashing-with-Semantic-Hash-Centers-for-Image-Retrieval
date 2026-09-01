@@ -1,201 +1,224 @@
 import copy
-
-from utils.tools import *
-from network import *
-
+import json
 import os
+import random
+import time
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
 import torch
 import torch.optim as optim
 import torch.optim.lr_scheduler as lr_scheduler
-import torch.nn.functional as F
+from scipy.linalg import hadamard
 
-import matplotlib.pyplot as plt
-import time
-import numpy as np
-from scipy.linalg import hadamard  # direct import  hadamrd matrix from scipy
-import random
-from data.data_loader import load_data
+from utils.tools import CalcTopMapPerQuery, CalcTopMapWithPR, compute_result
 
-torch.multiprocessing.set_sharing_strategy('file_system')
+torch.multiprocessing.set_sharing_strategy("file_system")
 
 
 class CSQLoss(torch.nn.Module):
     def __init__(self, args, bit, hash_center):
-        super(CSQLoss, self).__init__()
-        self.is_single_label = True
+        super().__init__()
         self.hash_targets = hash_center.to(args.device)
         self.multi_label_random_center = torch.randint(2, (bit,)).float().to(args.device)
         self.criterion = torch.nn.BCELoss().to(args.device)
 
-    def forward(self, u, y, ind, args):
-        u = u.tanh()
-        hash_center = self.label2center(y)
-        center_loss = self.criterion(0.5 * (u + 1), 0.5 * (hash_center + 1))
-        Q_loss = (u.abs() - 1).pow(2).mean()
+    def forward(self, output, labels, indices, args):
+        del indices
+        continuous_code = output.tanh()
+        target_center = self.label2center(labels)
+        center_loss = self.criterion(
+            0.5 * (continuous_code + 1), 0.5 * (target_center + 1)
+        )
+        quantization_loss = (continuous_code.abs() - 1).pow(2).mean()
+        return center_loss + args.lambd * quantization_loss
 
-        return center_loss + args.lambd * Q_loss
+    def label2center(self, labels):
+        return self.hash_targets[labels.argmax(dim=1)]
 
-    def label2center(self, y):
-        hash_center = self.hash_targets[y.argmax(axis=1)]
-        return hash_center
-
-    # use algorithm 1 to generate hash centers
     def get_hash_targets(self, n_class, bit):
-        H_K = hadamard(bit)
-        H_2K = np.concatenate((H_K, -H_K), 0)
-        hash_targets = torch.from_numpy(H_2K[:n_class]).float()
-
-        if H_2K.shape[0] < n_class:
-            hash_targets.resize_(n_class, bit)
-            for k in range(20):
-                for index in range(H_2K.shape[0], n_class):
-                    ones = torch.ones(bit) # 生成一个全1向量
-                    # Bernouli distribution
-                    sa = random.sample(list(range(bit)), bit // 2)
-                    ones[sa] = -1
-                    hash_targets[index] = ones
-                # to find average/min  pairwise distance
-                c = []
-                for i in range(n_class):
-                    for j in range(n_class):
-                        if i < j:
-                            TF = sum(hash_targets[i] != hash_targets[j])
-                            c.append(TF)
-                c = np.array(c)
-
-                if c.min() > bit / 4 and c.mean() >= bit / 2:
-                    print(c.min(), c.mean())
+        base = hadamard(bit)
+        targets = torch.from_numpy(np.concatenate((base, -base), 0)[:n_class]).float()
+        if 2 * bit < n_class:
+            targets.resize_(n_class, bit)
+            for _ in range(20):
+                for index in range(2 * bit, n_class):
+                    ones = torch.ones(bit)
+                    ones[random.sample(list(range(bit)), bit // 2)] = -1
+                    targets[index] = ones
+                distances = np.asarray(
+                    [
+                        sum(targets[i] != targets[j])
+                        for i in range(n_class)
+                        for j in range(i + 1, n_class)
+                    ]
+                )
+                if distances.min() > bit / 4 and distances.mean() >= bit / 2:
                     break
-        return hash_targets
+        return targets
 
 
-def train_val(args, hash_center, train_loader, test_loader, database_loader, num_database):
-    print('==========start to train SHC NetWork==========')
+def _evaluate(query_loader, database_loader, net, args, num_database):
+    query_binary, query_label = compute_result(query_loader, net, args.device)
+    database_binary, database_label = compute_result(
+        database_loader, net, args.device
+    )
+    map_values, pr_data = CalcTopMapWithPR(
+        query_binary.numpy(),
+        query_label.numpy(),
+        database_binary.numpy(),
+        database_label.numpy(),
+        args.topK,
+        num_database,
+    )
+    metrics = {
+        "mAP@ALL": float(map_values[0]),
+        "mAP@100": float(map_values[1]),
+        "mAP@1000": float(map_values[2]),
+    }
+    if not all(np.isfinite(value) for value in metrics.values()):
+        raise FloatingPointError(f"Non-finite retrieval metrics: {metrics}")
+    return metrics, pr_data, query_binary, query_label, database_binary, database_label
+
+
+def _save_curves(run_dir, losses, learning_rates):
+    figure = plt.figure()
+    plt.plot(range(1, len(learning_rates) + 1), learning_rates)
+    plt.xlabel("epoch")
+    plt.ylabel("learning rate")
+    plt.title("Learning rate")
+    figure.savefig(os.path.join(run_dir, "learning_rate.png"), dpi=160, bbox_inches="tight")
+    plt.close(figure)
+
+    figure = plt.figure()
+    plt.plot(range(1, len(losses) + 1), losses, label="loss")
+    plt.legend()
+    plt.xlabel("epoch")
+    plt.ylabel("loss")
+    plt.title("Training loss")
+    figure.savefig(os.path.join(run_dir, "training_loss.png"), dpi=160, bbox_inches="tight")
+    plt.close(figure)
+
+
+def train_val(
+    args,
+    hash_center,
+    train_loader,
+    val_loader,
+    query_loader,
+    database_loader,
+    num_database,
+):
+    print("========== start SHC B0 network training ==========")
     bit = args.code_length
     net = args.net(bit).to(args.device)
-
     optimizer = optim.RMSprop(net.parameters(), lr=args.lr, weight_decay=1e-5)
-    scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epoch, eta_min=1e-7)
+    scheduler = lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=args.epoch, eta_min=1e-7
+    )
 
-    hash_center = hash_center.to(torch.float32)
-    if hash_center.shape != (args.num_classes, args.code_length):
-        hash_center = hash_center.t()  # n_class * bit
-
-
+    hash_center = hash_center.float()
+    if hash_center.shape != (args.num_classes, bit):
+        hash_center = hash_center.T
     criterion = CSQLoss(args, bit, hash_center)
 
-    result_dic = {}
-    Best_mAP_ALL = 0
-    Best_mAP_100 = 0
-    Best_mAP_1000 = 0
-    mAP_ALL_list = []
-    mAP_100_list = []
-    mAP_1000_list = []
-    lr_values = []
-    loss_list = []
+    best_validation_map = float("-inf")
+    best_epoch = 0
+    best_state = {key: value.detach().cpu() for key, value in net.state_dict().items()}
+    history, losses, learning_rates = [], [], []
 
-    for epoch in range(0, args.epoch):
-
-        this_lr = optimizer.param_groups[0]['lr']
-        lr_values.append(this_lr)
-        this_lr_str = "{:.5e}".format(this_lr)
-        current_time = time.strftime('%H:%M:%S', time.localtime(time.time()))
-
-        print("%s[%2d/%2d][%s] bit:%d, dataset:%s, Lr:%s, training...." % (
-            args.info, epoch + 1, args.epoch, current_time, bit, args.dataset, this_lr_str), end="")
-
+    for epoch in range(args.epoch):
+        started = time.time()
+        learning_rates.append(optimizer.param_groups[0]["lr"])
         net.train()
-
-        train_loss = 0
-        for image, label, ind in train_loader:
-            image = image.to(args.device)
-            label = label.to(args.device)
-
-            optimizer.zero_grad()
-
-            u = net(image)
-
-            # loss = criterion(u, label.float(), ind, config, D)
-            loss = criterion(u, label.float(), ind, args)
-            train_loss += loss.item()
-
-
+        total_loss = 0.0
+        for images, labels, indices in train_loader:
+            images = images.to(args.device, non_blocking=True)
+            labels = labels.to(args.device, non_blocking=True)
+            optimizer.zero_grad(set_to_none=True)
+            output = net(images)
+            loss = criterion(output, labels, indices, args)
+            if not torch.isfinite(loss):
+                raise FloatingPointError(f"Non-finite hash loss at epoch {epoch + 1}")
             loss.backward()
-            # torch.nn.utils.clip_grad_norm_(net.parameters(), 5.0)
             optimizer.step()
-
+            total_loss += loss.item()
         scheduler.step()
+        epoch_loss = total_loss / max(len(train_loader), 1)
+        losses.append(epoch_loss)
 
-        train_loss = train_loss / len(train_loader)
+        should_validate = (epoch + 1) % args.test_map == 0 or epoch + 1 == args.epoch
+        record = {
+            "epoch": epoch + 1,
+            "loss": epoch_loss,
+            "lr": learning_rates[-1],
+            "seconds": time.time() - started,
+        }
+        if should_validate:
+            validation_metrics, _, _, _, _, _ = _evaluate(
+                val_loader, database_loader, net, args, num_database
+            )
+            record["validation"] = validation_metrics
+            if validation_metrics["mAP@ALL"] > best_validation_map:
+                best_validation_map = validation_metrics["mAP@ALL"]
+                best_epoch = epoch + 1
+                best_state = {
+                    key: value.detach().cpu() for key, value in net.state_dict().items()
+                }
+            print(
+                f"{args.info} epoch={epoch + 1} loss={epoch_loss:.5f} "
+                f"val_ALL={validation_metrics['mAP@ALL']:.5f} "
+                f"val_100={validation_metrics['mAP@100']:.5f} "
+                f"val_1000={validation_metrics['mAP@1000']:.5f}"
+            )
+        else:
+            print(f"{args.info} epoch={epoch + 1} loss={epoch_loss:.5f}")
+        history.append(record)
 
-        loss_list.append(train_loss)
+    net.load_state_dict(best_state)
+    net.to(args.device)
+    final_metrics, pr_data, query_binary, query_label, database_binary, database_label = (
+        _evaluate(query_loader, database_loader, net, args, num_database)
+    )
+    per_query_ap = CalcTopMapPerQuery(
+        query_binary.numpy(),
+        query_label.numpy(),
+        database_binary.numpy(),
+        database_label.numpy(),
+        args.topK,
+    )
+    summary = {
+        "selected_epoch": best_epoch,
+        "selection_metric": "validation mAP@ALL",
+        "best_validation_mAP@ALL": best_validation_map,
+        "query_metrics": final_metrics,
+    }
 
-        print("\b\b\b\b\b\b\b loss:%.5f" % (train_loss))
+    os.makedirs(args.run_dir, exist_ok=True)
+    torch.save(best_state, os.path.join(args.run_dir, "best_model_state.pt"))
+    torch.save(
+        {
+            "query_binary": query_binary,
+            "query_label": query_label,
+            "database_binary": database_binary,
+            "database_label": database_label,
+            "pr_data": pr_data,
+            "per_query_ap": per_query_ap,
+        },
+        os.path.join(args.run_dir, "retrieval_outputs.pt"),
+    )
+    with open(os.path.join(args.run_dir, "training_history.json"), "w", encoding="utf-8") as f:
+        json.dump(history, f, ensure_ascii=False, indent=2)
+    with open(os.path.join(args.run_dir, "metrics.json"), "w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
+    _save_curves(args.run_dir, losses, learning_rates)
 
-        if (epoch + 1) % args.test_map == 0:
-            net.eval()
-            with torch.no_grad():
-                # Best_mAP = validate(args, Best_mAP, test_loader, dataset_loader, net, bit, epoch, num_dataset)
-                tst_binary, tst_label = compute_result(test_loader, net, device=args.device)
-                trn_binary, trn_label = compute_result(database_loader, net, device=args.device)
-                # mAP_list = CalcTopMap(trn_binary.numpy(), tst_binary.numpy(), trn_label.numpy(), tst_label.numpy(), args.topK)
-                mAP_list, PR_data = CalcTopMapWithPR(tst_binary.numpy(), tst_label.numpy(),
-                                                     trn_binary.numpy(), trn_label.numpy(),
-                                                     args.topK, num_database)
-                mAP_ALL = mAP_list[0]
-                mAP_100 = mAP_list[1]
-                mAP_1000 = mAP_list[2]
-                mAP_ALL_list.append(mAP_ALL)
-                mAP_100_list.append(mAP_100)
-                mAP_1000_list.append(mAP_1000)
-
-            if mAP_ALL > Best_mAP_ALL:
-                Best_mAP_ALL = mAP_ALL
-                best_net = copy.deepcopy(net)
-            if mAP_100 > Best_mAP_100:
-                Best_mAP_100 = mAP_100
-            if mAP_1000 > Best_mAP_1000:
-                Best_mAP_1000 = mAP_1000
-
-            print(f"{args.info} epoch:{epoch + 1} bit:{bit} dataset:{args.dataset}")
-            print(f"MAP ALL:{mAP_ALL} Best MAP ALL: {Best_mAP_ALL}")
-            print(f"MAP 100:{mAP_100} Best MAP 100: {Best_mAP_100}")
-            print(f"MAP 1000:{mAP_1000} Best MAP 1000: {Best_mAP_1000}")
-        if (epoch + 1) % args.epoch == 0:
-            print('[SHC] final_mAP_ALL:%.5f' % (Best_mAP_ALL))
-            print('[SHC] final_mAP_100:%.5f' % (Best_mAP_100))
-            print('[SHC] final_mAP_1000:%.5f' % (Best_mAP_1000))
-
-    tst_binary, tst_label = compute_result(test_loader, best_net, device=args.device)
-    trn_binary, trn_label = compute_result(database_loader, best_net, device=args.device)
-    _, best_PR_data = CalcTopMapWithPR(tst_binary.numpy(), tst_label.numpy(),
-                                         trn_binary.numpy(), trn_label.numpy(),
-                                         args.topK, num_database)
-    result_dic['loss'] = loss_list
-    result_dic['mAP@all'] = mAP_ALL_list
-    result_dic['mAP@100'] = mAP_100_list
-    result_dic['mAP@1000'] = mAP_1000_list
-    result_dic['PR_data'] = best_PR_data
-    result_dic['net'] = best_net
-    os.makedirs(f'./save/result_log/{args.dataset}', exist_ok=True)
-    torch.save(result_dic, f'./save/result_log/{args.dataset}/SHC_bit_{bit}_result_dic.pt')
-
-
-    plt.figure()
-    plt.plot(list(range(epoch + 1)), lr_values)
-    plt.xlabel('epoch')
-    plt.ylabel('lr')
-    plt.title('lr changes over epoch')
-
-    plt.figure()
-    # 绘制图形
-    plt.plot(list(range(epoch + 1)), loss_list, label='loss')
-
-    # 添加图例、标签等
-    plt.legend()  # 显示图例
-    plt.xlabel('epoch')  # x轴标签
-    plt.ylabel('loss')  # y轴标签
-    plt.title('loss changes over epoch')  # 图表标题
-    plt.show()
-
-    print('==========finish to train SHC NetWork==========')
+    print(
+        f"Selected epoch {best_epoch}; query mAP@ALL={final_metrics['mAP@ALL']:.5f}, "
+        f"mAP@100={final_metrics['mAP@100']:.5f}, "
+        f"mAP@1000={final_metrics['mAP@1000']:.5f}"
+    )
+    print("========== finished SHC B0 network training ==========")
+    return summary

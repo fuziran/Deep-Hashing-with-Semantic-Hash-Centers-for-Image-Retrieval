@@ -40,15 +40,23 @@ resnet_dict = {"ResNet18": models.resnet18, "ResNet34": models.resnet34, "ResNet
                "ResNet101": models.resnet101, "ResNet152": models.resnet152}
 
 
+def _build_resnet(res_model="ResNet34"):
+    """Build ImageNet-pretrained ResNet with one consistent local weight path."""
+    local_weight_path = "./models_ckpt/resnet34-b627a593.pth"
+    if res_model == "ResNet34" and os.path.exists(local_weight_path):
+        model_resnet = resnet_dict[res_model](weights=None)
+        state = torch.load(local_weight_path, map_location="cpu")
+        model_resnet.load_state_dict(state)
+        return model_resnet
+    if res_model == "ResNet34":
+        return resnet_dict[res_model](weights=models.ResNet34_Weights.IMAGENET1K_V1)
+    return resnet_dict[res_model](weights="DEFAULT")
+
+
 class ResNet(nn.Module):
     def __init__(self, hash_bit, res_model="ResNet34"):
         super(ResNet, self).__init__()
-        if os.path.exists('./save/resnet34-b627a593.pth'):
-            model_resnet = resnet_dict[res_model](pretrained=False)
-            pre = torch.load('./models_ckpt/resnet34-b627a593.pth')  # 进行加载
-            model_resnet.load_state_dict(pre)
-        else:
-            model_resnet = resnet_dict[res_model](pretrained=True)
+        model_resnet = _build_resnet(res_model)
 
         self.conv1 = model_resnet.conv1
         self.bn1 = model_resnet.bn1
@@ -108,12 +116,7 @@ class NewNet(nn.Module):
 class ClassifyNet(nn.Module):
     def __init__(self, n_class, res_model="ResNet34"):
         super(ClassifyNet, self).__init__()
-        if os.path.exists('./save/resnet34-b627a593.pth'):
-            model_resnet = resnet_dict[res_model](pretrained=False)
-            pre = torch.load('./models_ckpt/resnet34-b627a593.pth')  # 进行加载
-            model_resnet.load_state_dict(pre)
-        else:
-            model_resnet = resnet_dict[res_model](pretrained=True)
+        model_resnet = _build_resnet(res_model)
 
 
         self.conv1 = model_resnet.conv1
@@ -237,12 +240,7 @@ class LTHNet(nn.Module):
 class orthohashNet(nn.Module):
     def __init__(self, hash_bit, nclass, res_model="ResNet34"):
         super(orthohashNet, self).__init__()
-        if os.path.exists('./save/resnet34-b627a593.pth'):
-            model_resnet = resnet_dict[res_model](pretrained=False)
-            pre = torch.load('./models_ckpt/resnet34-b627a593.pth')  # 进行加载
-            model_resnet.load_state_dict(pre)
-        else:
-            model_resnet = resnet_dict[res_model](pretrained=True)
+        model_resnet = _build_resnet(res_model)
 
         self.conv1 = model_resnet.conv1
         self.bn1 = model_resnet.bn1

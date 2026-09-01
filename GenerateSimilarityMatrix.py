@@ -1,114 +1,189 @@
-import os.path
-import torch.nn.functional as F
+import copy
+import json
+import os
+import time
+
+import torch
+import torch.nn as nn
 import torch.optim as optim
 import torch.optim.lr_scheduler as lr_scheduler
-import time
-from utils.tools import *
-from network import *
-from loguru import logger
 
-def TrainClassificationNetwork(args, train_loader, test_loader):
-    print('==========start to generate ClassificationNetwork==========')
+from network import ClassifyNet
+from utils.experiment import build_cache_metadata, load_cache, save_cache
+
+
+def normalize_and_symmetrize_similarity(class_average, eps=1e-12):
+    """Apply the paper order: row normalization, symmetrization, diagonal=1."""
+    row_mean = class_average.mean(dim=1, keepdim=True)
+    centered = class_average - row_mean
+    scale = centered.abs().amax(dim=1, keepdim=True).clamp_min(eps)
+    normalized = centered / scale
+    similarity = (normalized + normalized.T) / 2
+    similarity.fill_diagonal_(1.0)
+    return similarity
+
+
+def _accuracy(net, dataloader, device):
+    net.eval()
+    correct, total = 0, 0
+    with torch.no_grad():
+        for images, labels, _ in dataloader:
+            images = images.to(device, non_blocking=True)
+            targets = labels.argmax(dim=1).to(device, non_blocking=True)
+            logits, _ = net(images)
+            correct += (logits.argmax(dim=1) == targets).sum().item()
+            total += targets.numel()
+    return correct / total if total else 0.0
+
+
+def _classifier_cache(args):
+    metadata = build_cache_metadata(args, "classifier")
+    path = os.path.join(
+        args.output_dir,
+        "ClassificationNet",
+        f"{args.dataset}_{metadata['config_hash']}.pt",
+    )
+    return path, metadata
+
+
+def TrainClassificationNetwork(args, train_loader, val_loader):
+    print("========== start classification network ==========")
+    cache_path, metadata = _classifier_cache(args)
+    if not args.force_recompute:
+        cached_state = load_cache(cache_path, metadata)
+        if cached_state is not None:
+            net = ClassifyNet(args.num_classes).to(args.device)
+            net.load_state_dict(cached_state)
+            print(f"Loaded audited classifier cache: {cache_path}")
+            return net
+
     net = ClassifyNet(args.num_classes).to(args.device)
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.RMSprop(
-        net.parameters(),
-        lr=args.lr,
-        weight_decay=1e-5,
-    )
+    optimizer = optim.RMSprop(net.parameters(), lr=args.lr, weight_decay=1e-5)
     scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.classify_epoch)
+    best_accuracy = float("-inf")
+    best_state = copy.deepcopy(net.state_dict())
+    history = []
 
-    train_total = 0
-    train_correct = 0
-    test_total = 0
-    test_correct = 0
-    running_loss = 0.
-    best_pre = 0.
     for epoch in range(args.classify_epoch):
-        tic = time.time()
-        this_lr = optimizer.param_groups[0]['lr']
-        this_lr_str = "{:.5e}".format(this_lr)
+        started = time.time()
         net.train()
-        for data, targets, index in train_loader:
-            # print(data.shape)
-            targets = targets.to(torch.float32)
-            data, targets, index = data.to(args.device), targets.to(args.device), index.to(args.device)
-            optimizer.zero_grad()
-
-            _, pre_label = net(data)
-            _, pre_true_label = torch.max(pre_label, 1)
-            train_total += targets.size(0)
-            _, true_targets = torch.max(targets, 1)
-            train_correct += (pre_true_label == true_targets).sum().item()
-
-            loss = criterion(pre_label, targets)
-            running_loss = running_loss + loss.item()
+        epoch_loss, correct, total = 0.0, 0, 0
+        for images, labels, _ in train_loader:
+            images = images.to(args.device, non_blocking=True)
+            targets = labels.argmax(dim=1).to(args.device, non_blocking=True)
+            optimizer.zero_grad(set_to_none=True)
+            logits, _ = net(images)
+            loss = criterion(logits, targets)
+            if not torch.isfinite(loss):
+                raise FloatingPointError(f"Non-finite classification loss at epoch {epoch + 1}")
             loss.backward()
             optimizer.step()
-        train_pre = train_correct / train_total
+            epoch_loss += loss.item() * targets.numel()
+            correct += (logits.argmax(dim=1) == targets).sum().item()
+            total += targets.numel()
         scheduler.step()
 
-        if epoch % args.test_map == args.test_map - 1:
-            training_time = time.time() - tic
-            tic = time.time()
-            net.eval()
-            with torch.no_grad():
-                for data, targets, index in test_loader:
-                    data, targets, index = data.to(args.device), targets.to(args.device), index.to(args.device)
-                    _, pre_true_label = torch.max(net(data)[1], 1)
-                    _, true_targets = torch.max(targets, 1)
-                    test_total += targets.size(0)
-                    test_correct += (pre_true_label == true_targets).sum().item()
-                test_pre = test_correct / test_total
-            if test_pre > best_pre:
-                best_pre = test_pre
-            testing_time = time.time() - tic
-            logger.info('[iter:{}/{}][dataset:{}][lr:{}][loss:{:.2f}][train_pre:{:.4f}%][test_pre:{:.4f}%][best_pre:{:.4f}%][training_time:{:.2f}][testing_time:{:.2f}]'.format(
-                epoch + 1,
-                args.classify_epoch,
-                args.dataset,
-                this_lr_str,
-                running_loss / args.test_map,
-                100 * train_pre,
-                100 * test_pre,
-                100 * best_pre,
-                training_time,
-                testing_time,
-            ))
-            running_loss = 0.
-    os.makedirs(f'./save/ClassificationNet/', exist_ok=True)
-    torch.save(net, f'./save/ClassificationNet/{args.dataset}_ClassificationNet.pt')
-    print('==========success generate ClassificationNetwork==========')
+        should_validate = (
+            (epoch + 1) % args.test_map == 0 or epoch + 1 == args.classify_epoch
+        )
+        val_accuracy = None
+        if should_validate:
+            val_accuracy = _accuracy(net, val_loader, args.device)
+            if val_accuracy > best_accuracy:
+                best_accuracy = val_accuracy
+                best_state = copy.deepcopy(net.state_dict())
+        record = {
+            "epoch": epoch + 1,
+            "loss": epoch_loss / max(total, 1),
+            "train_accuracy": correct / max(total, 1),
+            "validation_accuracy": val_accuracy,
+            "lr": optimizer.param_groups[0]["lr"],
+            "seconds": time.time() - started,
+        }
+        history.append(record)
+        if should_validate:
+            print(
+                f"classifier {epoch + 1}/{args.classify_epoch} "
+                f"loss={record['loss']:.5f} train={record['train_accuracy']:.4%} "
+                f"validation={val_accuracy:.4%} best={best_accuracy:.4%}"
+            )
+
+    best_state = {key: value.detach().cpu() for key, value in best_state.items()}
+    save_cache(cache_path, best_state, metadata)
+    with open(
+        os.path.join(args.run_dir, "classification_history.json"),
+        "w",
+        encoding="utf-8",
+    ) as f:
+        json.dump(history, f, ensure_ascii=False, indent=2)
+    net.load_state_dict(best_state)
+    net.to(args.device)
+    print(f"Best classifier validation accuracy: {best_accuracy:.4%}")
     return net
-def GenerateSimilarityMatrix(args, train_loader, test_loader):
-    if os.path.exists(f'./save/ClassificationNet/{args.dataset}_ClassificationNet.pt'):
-        print('==========ClassificationNet has already generated==========')
-        net = torch.load(f'./save/ClassificationNet/{args.dataset}_ClassificationNet.pt').to(args.device)
-    else:
-        net = TrainClassificationNetwork(args, train_loader, test_loader)
-    print('==========start to generate SimilarityMatrix==========')
-    S = torch.zeros(args.num_classes, args.num_classes).to(args.device)
+
+
+def _similarity_cache(args):
+    metadata = build_cache_metadata(args, "similarity")
+    path = os.path.join(
+        args.output_dir,
+        "SimilarityMatrix",
+        f"{args.dataset}_{metadata['config_hash']}.pt",
+    )
+    return path, metadata
+
+
+def GenerateSimilarityMatrix(args, train_loader, relation_loader, val_loader):
+    cache_path, metadata = _similarity_cache(args)
+    if not args.force_recompute:
+        cached = load_cache(cache_path, metadata)
+        if cached is not None:
+            print(f"Loaded audited similarity cache: {cache_path}")
+            return cached
+
+    net = TrainClassificationNetwork(args, train_loader, val_loader)
+    print("========== start similarity matrix ==========")
+    class_sum = torch.zeros(
+        args.num_classes, args.num_classes, device=args.device, dtype=torch.float64
+    )
+    class_count = torch.zeros(
+        args.num_classes, device=args.device, dtype=torch.float64
+    )
     net.eval()
     with torch.no_grad():
-        for data, targets, index in train_loader:
-            data, targets, index = data.to(args.device), targets.to(args.device), index.to(args.device)
-            batch_size = targets.shape[0]
-            p_dis, _ = net(data) # p_dis就是p_0
-            _, true_targets = torch.max(targets, 1) # 获得要mask的j，矩阵形式
-            for i in range(batch_size):
-                tmp = p_dis[i].clone()
-                tmp[true_targets[i]] = float('-inf') # 对最大值做mask（变成-INF）
-                S[true_targets[i]] += F.softmax(tmp)
+        for images, labels, _ in relation_loader:
+            images = images.to(args.device, non_blocking=True)
+            targets = labels.argmax(dim=1).to(args.device, non_blocking=True)
+            logits, _ = net(images)
+            mask_targets = (
+                logits.argmax(dim=1)
+                if args.mask_strategy == "predicted_argmax"
+                else targets
+            )
+            masked_logits = logits.double().clone()
+            masked_logits.scatter_(1, mask_targets[:, None], float("-inf"))
+            probabilities = torch.softmax(masked_logits, dim=1)
+            class_sum.index_add_(0, targets, probabilities)
+            class_count.index_add_(
+                0, targets, torch.ones_like(targets, dtype=torch.float64)
+            )
 
-    mask = torch.eye(args.num_classes).bool()
-    S = (S + S.T) / 2
-    for i in range(args.num_classes):
-        S_max = S[i].max()
-        S_min = S[i].min()
-        S_mean = S[i].mean()
-        S[i] = (S[i] - S_mean) / max(abs(S_max - S_mean), abs(S_min - S_mean))
-    S[mask] = 1
-    os.makedirs(f'./save/SimilarityMatrix/', exist_ok=True)
-    torch.save(S, f'./save/SimilarityMatrix/{args.dataset}_Similarity_Matrix.pt')
-    print('==========success generate SimilarityMatrix==========')
-    return S
+    if torch.any(class_count == 0):
+        missing = torch.where(class_count == 0)[0].tolist()
+        raise RuntimeError(f"No Stage 1 samples for classes: {missing}")
+    class_average = class_sum / class_count[:, None]
+    similarity = normalize_and_symmetrize_similarity(class_average).float().cpu()
+    if not torch.isfinite(similarity).all():
+        raise FloatingPointError("Similarity matrix contains NaN or Inf")
+    save_cache(cache_path, similarity, metadata)
+    torch.save(
+        {
+            "class_count": class_count.cpu(),
+            "class_average": class_average.float().cpu(),
+            "similarity": similarity,
+            "mask_strategy": args.mask_strategy,
+        },
+        os.path.join(args.run_dir, "stage1_diagnostics.pt"),
+    )
+    print(f"Saved audited similarity cache: {cache_path}")
+    return similarity

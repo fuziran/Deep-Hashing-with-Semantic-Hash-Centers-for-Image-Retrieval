@@ -1,0 +1,110 @@
+import argparse
+import os
+import tempfile
+import unittest
+
+import numpy as np
+import torch
+
+from GenerateSemanticHashCenters import pair_quadratic_gradient
+from GenerateSimilarityMatrix import normalize_and_symmetrize_similarity
+from data.data_loader import _split_sha256, _stratified_split_cifar100
+from utils.experiment import build_cache_metadata, load_cache, save_cache
+from utils.tools import _calc_map_for_one_topk
+
+
+class TestCifarSplit(unittest.TestCase):
+    def setUp(self):
+        self.labels = np.repeat(np.arange(100, dtype=np.int64), 600)
+
+    def test_counts_disjointness_and_class_balance(self):
+        train, validation, query, database = _stratified_split_cifar100(
+            self.labels, seed=60, val_per_class=10
+        )
+        self.assertEqual((len(train), len(validation), len(query), len(database)),
+                         (9000, 1000, 5000, 45000))
+        combined = np.concatenate((train, validation, query, database))
+        self.assertEqual(len(np.unique(combined)), 60000)
+        for indices, expected in (
+            (train, 90), (validation, 10), (query, 50), (database, 450)
+        ):
+            counts = np.bincount(self.labels[indices], minlength=100)
+            np.testing.assert_array_equal(counts, np.full(100, expected))
+
+    def test_same_seed_same_hash(self):
+        first = _stratified_split_cifar100(self.labels, seed=60, val_per_class=10)
+        second = _stratified_split_cifar100(self.labels, seed=60, val_per_class=10)
+        self.assertEqual(_split_sha256(*first), _split_sha256(*second))
+
+
+class TestSimilarityMatrix(unittest.TestCase):
+    def test_paper_order_invariants(self):
+        class_average = torch.tensor(
+            [[0.0, 0.2, 0.8], [0.4, 0.0, 0.6], [0.7, 0.3, 0.0]],
+            dtype=torch.float64,
+        )
+        similarity = normalize_and_symmetrize_similarity(class_average)
+        self.assertTrue(torch.allclose(similarity, similarity.T))
+        self.assertTrue(torch.allclose(torch.diag(similarity), torch.ones(3)))
+        self.assertTrue(torch.isfinite(similarity).all())
+
+
+class TestCenterGradient(unittest.TestCase):
+    def test_pair_gradient_matches_autograd(self):
+        h_i = torch.tensor([0.2, -0.3, 0.7], requires_grad=True)
+        h_j = torch.tensor([-0.5, 0.4, 0.1])
+        loss = torch.dot(h_i, h_j).pow(2)
+        loss.backward()
+        expected = h_i.grad
+        actual = pair_quadratic_gradient(h_i.detach(), h_j)
+        self.assertTrue(torch.allclose(actual, expected))
+
+
+class TestMetrics(unittest.TestCase):
+    def test_hand_computed_map(self):
+        query_binary = np.ones((1, 4), dtype=np.float32)
+        retrieval_binary = np.asarray(
+            [
+                [1, 1, 1, 1],
+                [-1, 1, 1, 1],
+                [-1, -1, 1, 1],
+                [-1, -1, -1, 1],
+                [-1, -1, -1, -1],
+            ],
+            dtype=np.float32,
+        )
+        query_label = np.asarray([[1, 0]], dtype=np.float32)
+        retrieval_label = np.asarray(
+            [[1, 0], [0, 1], [1, 0], [0, 1], [1, 0]], dtype=np.float32
+        )
+        actual = _calc_map_for_one_topk(
+            query_binary, query_label, retrieval_binary, retrieval_label, -1
+        )
+        expected = (1 / 1 + 2 / 3 + 3 / 5) / 3
+        self.assertAlmostEqual(actual, expected)
+
+
+class TestCacheMetadata(unittest.TestCase):
+    def _args(self, seed):
+        return argparse.Namespace(
+            dataset="cifar-100-new-seg",
+            seed=seed,
+            split_hash="split",
+            num_classes=100,
+            code_length=32,
+            mask_strategy="predicted_argmax",
+            git_commit="commit",
+        )
+
+    def test_mismatch_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "cache.pt")
+            metadata = build_cache_metadata(self._args(60), "similarity")
+            save_cache(path, torch.ones(2), metadata)
+            mismatched = build_cache_metadata(self._args(40), "similarity")
+            with self.assertRaises(RuntimeError):
+                load_cache(path, mismatched)
+
+
+if __name__ == "__main__":
+    unittest.main()
