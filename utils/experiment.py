@@ -54,6 +54,8 @@ def build_cache_metadata(args, stage):
         )
     if stage in {"similarity", "centers"}:
         metadata["mask_strategy"] = args.mask_strategy
+    if stage == "centers":
+        metadata["similarity_config_hash"] = args.similarity_hash
     if stage in {"mds", "centers"}:
         metadata["code_length"] = args.code_length
     metadata["config_hash"] = stable_config_hash(metadata)

@@ -94,6 +94,7 @@ class TestCacheMetadata(unittest.TestCase):
             code_length=32,
             mask_strategy="predicted_argmax",
             git_commit="commit",
+            similarity_hash="similarity",
         )
 
     def test_mismatch_is_rejected(self):

@@ -135,6 +135,7 @@ def _similarity_cache(args):
 
 def GenerateSimilarityMatrix(args, train_loader, relation_loader, val_loader):
     cache_path, metadata = _similarity_cache(args)
+    args.similarity_hash = metadata["config_hash"]
     if not args.force_recompute:
         cached = load_cache(cache_path, metadata)
         if cached is not None:

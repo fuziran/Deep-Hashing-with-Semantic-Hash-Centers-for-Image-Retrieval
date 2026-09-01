@@ -95,6 +95,10 @@ def main():
         "split_sha256": args.split_hash,
         "code_length": args.code_length,
         "mask_strategy": args.mask_strategy,
+        "classification_epochs": args.classify_epoch,
+        "hash_epochs": args.epoch,
+        "learning_rate": args.lr,
+        "validation_per_class": args.val_per_class,
         "git_commit": args.git_commit,
     }
     args.run_id = stable_config_hash(run_config)
