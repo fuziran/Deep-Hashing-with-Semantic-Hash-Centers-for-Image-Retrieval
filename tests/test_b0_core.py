@@ -45,7 +45,14 @@ class TestSimilarityMatrix(unittest.TestCase):
         )
         similarity = normalize_and_symmetrize_similarity(class_average)
         self.assertTrue(torch.allclose(similarity, similarity.T))
-        self.assertTrue(torch.allclose(torch.diag(similarity), torch.ones(3)))
+        self.assertTrue(
+            torch.allclose(
+                torch.diag(similarity),
+                torch.ones(
+                    3, dtype=similarity.dtype, device=similarity.device
+                ),
+            )
+        )
         self.assertTrue(torch.isfinite(similarity).all())
 
 
@@ -95,6 +102,10 @@ class TestCacheMetadata(unittest.TestCase):
             mask_strategy="predicted_argmax",
             git_commit="commit",
             similarity_hash="similarity",
+            lr=7e-5,
+            classify_epoch=300,
+            resize_size=256,
+            crop_size=224,
         )
 
     def test_mismatch_is_rejected(self):
