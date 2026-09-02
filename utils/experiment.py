@@ -9,6 +9,8 @@ import torch
 
 
 def seed_everything(seed, deterministic=True):
+    if deterministic:
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -92,6 +94,9 @@ def write_run_manifest(args):
     manifest["torch_version"] = torch.__version__
     manifest["torch_cuda_version"] = torch.version.cuda
     manifest["cuda_available"] = torch.cuda.is_available()
+    manifest["cublas_workspace_config"] = os.environ.get(
+        "CUBLAS_WORKSPACE_CONFIG"
+    )
     if torch.cuda.is_available():
         manifest["gpu"] = torch.cuda.get_device_name(args.device)
     with open(os.path.join(args.run_dir, "config.json"), "w", encoding="utf-8") as f:

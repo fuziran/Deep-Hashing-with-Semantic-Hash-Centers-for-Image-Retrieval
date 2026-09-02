@@ -77,6 +77,7 @@ python3 -m unittest discover -s tests -v
 Run a one-epoch smoke test first:
 
 ```bash
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
 python3 run.py --dataset cifar-100-new-seg \
   --root ./data/cifar-100-python \
   --num-classes 100 --code-length 32 --seed 60 \

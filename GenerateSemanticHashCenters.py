@@ -282,6 +282,19 @@ def pairwise_hamming_distances(centers):
     )
     return distance_matrix[mask]
 
+
+def semantic_similarity_loss(similarity, centers):
+    bit = centers.shape[0]
+    return ((similarity - centers.T @ centers / bit) ** 2).mean()
+
+
+def keep_better_centers(best_centers, best_loss, candidate_centers, candidate_loss):
+    """Keep the raw/best candidate unless an iteration strictly improves it."""
+    candidate_value = float(candidate_loss)
+    if candidate_value < float(best_loss):
+        return candidate_centers.clone(), candidate_value, True
+    return best_centers, float(best_loss), False
+
 def GetMinimalDistanceHashCenter(args):
     metadata = build_cache_metadata(args, "mds")
     cache_path = os.path.join(
@@ -365,14 +378,8 @@ def GenerateSemanticHashCenters(args, S):
     device = args.device
     H = H.to(device)  # q * c
 
-    K = torch.zeros(args.num_classes, args.num_classes)
-    K = K.to(device)
-    for i in range(args.num_classes):
-        for j in range(args.num_classes):
-            if i == j:
-                K[i, j] = 0
-            else:
-                K[i, j] = args.code_length - 2 * d - H[:, i].T @ H[:, j]
+    K = args.code_length - 2 * d - H.T @ H
+    K.fill_diagonal_(0)
 
     lambd = torch.zeros(
         args.code_length, args.num_classes, device=device, dtype=torch.float32
@@ -391,16 +398,13 @@ def GenerateSemanticHashCenters(args, S):
     epochs = 20
     inner_epochs = 3
 
-    min_loss = 999
-
-    loss1 = (((S - 1 / args.code_length * H.T @ H) ** 2).sum() / (args.num_classes ** 2)).item()
-    loss2 = 0
-    for i in range(args.num_classes):
-        for j in range(args.num_classes):
-            if i == j:
-                continue
-            else:
-                loss2 += H[:, i].T @ H[:, j]
+    loss1 = semantic_similarity_loss(S, H).item()
+    min_loss = loss1
+    best_H = H.clone()
+    best_epoch = -1
+    center_history = []
+    gram = H.T @ H
+    loss2 = gram.sum() - gram.diag().sum()
     hamming_distances = pairwise_hamming_distances(H)
     gen_min_d = hamming_distances.min()
     gen_max_d = hamming_distances.max()
@@ -409,6 +413,20 @@ def GenerateSemanticHashCenters(args, S):
     print('loss2: ', loss2.item())
     print('min_d: ', gen_min_d.item())
     print('max_d: ', gen_max_d.item())
+    center_history.append(
+        {
+            "epoch": -1,
+            "candidate": "raw_mds",
+            "similarity_loss": loss1,
+            "min_hamming_distance": gen_min_d.item(),
+            "max_hamming_distance": gen_max_d.item(),
+            "attempted_updates": 0,
+            "accepted_updates": 0,
+            "constraint_rejections": 0,
+            "unchanged_updates": 0,
+            "is_best": True,
+        }
+    )
 
     for epoch in range(epochs):
         # M-step
@@ -420,6 +438,10 @@ def GenerateSemanticHashCenters(args, S):
         K = K.to(device)
 
         # H-step
+        attempted_updates = 0
+        accepted_updates = 0
+        constraint_rejections = 0
+        unchanged_updates = 0
         for inner_epoch in range(inner_epochs):
             for i in range(args.num_classes):
                 # i = 99 - i
@@ -439,14 +461,22 @@ def GenerateSemanticHashCenters(args, S):
                                 * H[:, j]
                             )
                         )
-                der = (2 / (args.code_length ** 2) * M @ M.T @ H[:, i] - 2 / args.code_length * M @ S[:, i]) + lambd[:, i].T + rho * (H[:, i] - M[:, i]) + sum
+                der = (2 / (args.code_length ** 2) * M @ M.T @ H[:, i] - 2 / args.code_length * M @ S[:, i]) + lambd[:, i] + rho * (H[:, i] - M[:, i]) + sum
 
                 H_tmp = H.clone()
-                H_tmp[:, i] = torch.sign(H_tmp[:, i] - 1 / eta * der)
+                attempted_updates += 1
+                projected = torch.sign(H_tmp[:, i] - 1 / eta * der)
+                projected = torch.where(projected == 0, H_tmp[:, i], projected)
+                if torch.equal(projected, H[:, i]):
+                    unchanged_updates += 1
+                    continue
+                H_tmp[:, i] = projected
                 if pairwise_hamming_distances(H_tmp).min() < d:
+                    constraint_rejections += 1
                     continue
                 else:
                     H[:, i] = H_tmp[:, i]
+                    accepted_updates += 1
 
         # lambd-step
         for i in range(args.num_classes):
@@ -457,15 +487,10 @@ def GenerateSemanticHashCenters(args, S):
             for j in range(args.num_classes):
                 if i == j:
                     continue
-                alpha[i, j] = alpha[i, j] + beta[i, j] * (args.code_length - 2 * d - H[:, i].T @ H[:, j] - K[i, j])
-        loss1 = (((S - 1 / args.code_length * H.T @ H) ** 2).sum() / (args.num_classes ** 2)).item()
-        loss2 = 0
-        for i in range(args.num_classes):
-            for j in range(args.num_classes):
-                if i == j:
-                    continue
-                else:
-                    loss2 += H[:, i].T @ H[:, j]
+                alpha[i, j] = alpha[i, j] + beta[i, j] * (args.code_length - 2 * d - torch.dot(H[:, i], H[:, j]) - K[i, j])
+        loss1 = semantic_similarity_loss(S, H).item()
+        gram = H.T @ H
+        loss2 = gram.sum() - gram.diag().sum()
         hamming_distances = pairwise_hamming_distances(H)
         gen_min_d = hamming_distances.min()
         gen_max_d = hamming_distances.max()
@@ -474,9 +499,30 @@ def GenerateSemanticHashCenters(args, S):
         print('loss2: ', loss2.item())
         print('min_d: ', gen_min_d.item())
         print('max_d: ', gen_max_d.item())
-        if loss1 < min_loss:
-            min_loss = loss1
-            best_H = H.clone()
+        print(
+            'updates: ',
+            f'attempted={attempted_updates}, accepted={accepted_updates}, '
+            f'constraint_rejected={constraint_rejections}, unchanged={unchanged_updates}',
+        )
+        best_H, min_loss, improved = keep_better_centers(
+            best_H, min_loss, H, loss1
+        )
+        if improved:
+            best_epoch = epoch
+        center_history.append(
+            {
+                "epoch": epoch,
+                "candidate": "semantic_update",
+                "similarity_loss": loss1,
+                "min_hamming_distance": gen_min_d.item(),
+                "max_hamming_distance": gen_max_d.item(),
+                "attempted_updates": attempted_updates,
+                "accepted_updates": accepted_updates,
+                "constraint_rejections": constraint_rejections,
+                "unchanged_updates": unchanged_updates,
+                "is_best": improved,
+            }
+        )
 
     H = best_H
     H = H.to('cpu')
@@ -485,7 +531,7 @@ def GenerateSemanticHashCenters(args, S):
     gen_min_d = hamming_distances.min()
     gen_max_d = hamming_distances.max()
     gen_var_d = hamming_distances.var()
-    similarity_match = ((S - 1 / args.code_length * H.T @ H) ** 2).mean()
+    similarity_match = semantic_similarity_loss(S, H)
     mean_hamming_distance = hamming_distances.mean()
     min_d_fre = torch.sum(torch.eq(hamming_distances, gen_min_d))
     print('gen_min_d: ', gen_min_d.item())
@@ -494,6 +540,14 @@ def GenerateSemanticHashCenters(args, S):
     print('similarity_match: ', similarity_match.item())
     print('mean_hamming_distance: ', mean_hamming_distance.item())
     print('min_d_fre: ', min_d_fre.item())
+    if not torch.all((H == -1) | (H == 1)):
+        raise RuntimeError("Saved SHC centers are not binary {-1,+1}")
+    if gen_min_d.item() < d:
+        raise RuntimeError(
+            f"Saved SHC centers violate minimum distance: {gen_min_d.item()} < {d}"
+        )
+    if similarity_match.item() > center_history[0]["similarity_loss"] + 1e-12:
+        raise RuntimeError("Saved SHC centers are worse than the raw MDS centers")
     save_cache(cache_path, H, metadata)
     torch.save(
         {
@@ -502,6 +556,9 @@ def GenerateSemanticHashCenters(args, S):
             "hamming_variance": gen_var_d,
             "similarity_loss": similarity_match,
             "mean_hamming_distance": mean_hamming_distance,
+            "raw_similarity_loss": center_history[0]["similarity_loss"],
+            "best_epoch": best_epoch,
+            "history": center_history,
         },
         os.path.join(args.run_dir, "stage2_diagnostics.pt"),
     )

@@ -6,7 +6,12 @@ import unittest
 import numpy as np
 import torch
 
-from GenerateSemanticHashCenters import pair_quadratic_gradient
+from GenerateSemanticHashCenters import (
+    keep_better_centers,
+    pair_quadratic_gradient,
+    pairwise_hamming_distances,
+    semantic_similarity_loss,
+)
 from GenerateSimilarityMatrix import normalize_and_symmetrize_similarity
 from data.data_loader import _split_sha256, _stratified_split_cifar100
 from utils.experiment import build_cache_metadata, load_cache, save_cache
@@ -65,6 +70,27 @@ class TestCenterGradient(unittest.TestCase):
         expected = h_i.grad
         actual = pair_quadratic_gradient(h_i.detach(), h_j)
         self.assertTrue(torch.allclose(actual, expected))
+
+    def test_raw_center_is_kept_when_candidate_is_worse(self):
+        raw = torch.tensor([[1.0, -1.0], [1.0, -1.0]])
+        candidate = torch.tensor([[1.0, 1.0], [1.0, -1.0]])
+        similarity = raw.T @ raw / raw.shape[0]
+        raw_loss = semantic_similarity_loss(similarity, raw).item()
+        candidate_loss = semantic_similarity_loss(similarity, candidate).item()
+        best, best_loss, improved = keep_better_centers(
+            raw, raw_loss, candidate, candidate_loss
+        )
+        self.assertFalse(improved)
+        self.assertEqual(best_loss, raw_loss)
+        self.assertTrue(torch.equal(best, raw))
+
+    def test_pairwise_distance_excludes_diagonal(self):
+        centers = torch.tensor(
+            [[1.0, 1.0, -1.0], [1.0, -1.0, -1.0]]
+        )
+        distances = pairwise_hamming_distances(centers)
+        self.assertEqual(distances.numel(), 3)
+        self.assertEqual(distances.min().item(), 1.0)
 
 
 class TestMetrics(unittest.TestCase):

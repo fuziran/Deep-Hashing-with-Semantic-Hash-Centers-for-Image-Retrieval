@@ -1,6 +1,9 @@
 import argparse
 import os
 
+# Must be set before the first CUDA BLAS workspace is created.
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
 import torch
 
 from GenerateSemanticHashCenters import GenerateSemanticHashCenters
