@@ -8,6 +8,7 @@ import torch
 
 from GenerateSemanticHashCenters import (
     keep_better_centers,
+    loss_is_not_worse,
     pair_quadratic_gradient,
     pairwise_hamming_distances,
     semantic_similarity_loss,
@@ -91,6 +92,12 @@ class TestCenterGradient(unittest.TestCase):
         distances = pairwise_hamming_distances(centers)
         self.assertEqual(distances.numel(), 3)
         self.assertEqual(distances.min().item(), 1.0)
+
+    def test_loss_guard_allows_float32_roundoff_only(self):
+        raw_loss = 0.05320427194237709
+        cpu_recomputed_loss = 0.05320427939295769
+        self.assertTrue(loss_is_not_worse(cpu_recomputed_loss, raw_loss))
+        self.assertFalse(loss_is_not_worse(raw_loss + 1e-3, raw_loss))
 
 
 class TestMetrics(unittest.TestCase):

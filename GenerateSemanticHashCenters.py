@@ -295,6 +295,14 @@ def keep_better_centers(best_centers, best_loss, candidate_centers, candidate_lo
         return candidate_centers.clone(), candidate_value, True
     return best_centers, float(best_loss), False
 
+
+def loss_is_not_worse(final_loss, reference_loss, atol=1e-7, rtol=1e-6):
+    """Compare float32 losses across CPU/GPU without rejecting roundoff noise."""
+    final_value = float(final_loss)
+    reference_value = float(reference_loss)
+    tolerance = atol + rtol * abs(reference_value)
+    return final_value <= reference_value + tolerance
+
 def GetMinimalDistanceHashCenter(args):
     metadata = build_cache_metadata(args, "mds")
     cache_path = os.path.join(
@@ -546,7 +554,9 @@ def GenerateSemanticHashCenters(args, S):
         raise RuntimeError(
             f"Saved SHC centers violate minimum distance: {gen_min_d.item()} < {d}"
         )
-    if similarity_match.item() > center_history[0]["similarity_loss"] + 1e-12:
+    if not loss_is_not_worse(
+        similarity_match.item(), center_history[0]["similarity_loss"]
+    ):
         raise RuntimeError("Saved SHC centers are worse than the raw MDS centers")
     save_cache(cache_path, H, metadata)
     torch.save(
