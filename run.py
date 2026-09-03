@@ -48,11 +48,23 @@ def load_config():
         help="Paper-formula protocol or released-code protocol for Stage 1 masking.",
     )
     parser.add_argument(
+        "--center-update-strategy",
+        choices=("monotonic_discrete_search",),
+        default="monotonic_discrete_search",
+        help="Deterministic Stage 2 update with loss and distance safeguards.",
+    )
+    parser.add_argument(
         "--stage",
         choices=("all", "similarity", "centers", "train"),
         default="all",
     )
     parser.add_argument("--output-dir", default="./save", type=str)
+    parser.add_argument(
+        "--similarity-cache",
+        type=str,
+        default=None,
+        help="Explicit audited Stage 1 cache to reuse after Stage 2-only changes.",
+    )
     parser.add_argument("--force-recompute", action="store_true")
     parser.add_argument(
         "--non-deterministic",
@@ -60,6 +72,9 @@ def load_config():
         help="Disable deterministic algorithms; not recommended for reported B0 runs.",
     )
     args = parser.parse_args()
+
+    if args.force_recompute and args.similarity_cache:
+        parser.error("--force-recompute and --similarity-cache cannot be used together")
 
     if len(args.topK) != 3:
         parser.error("--topK must contain exactly: -1 100 1000")
@@ -98,6 +113,8 @@ def main():
         "split_sha256": args.split_hash,
         "code_length": args.code_length,
         "mask_strategy": args.mask_strategy,
+        "center_update_strategy": args.center_update_strategy,
+        "similarity_cache": args.similarity_cache,
         "classification_epochs": args.classify_epoch,
         "hash_epochs": args.epoch,
         "learning_rate": args.lr,

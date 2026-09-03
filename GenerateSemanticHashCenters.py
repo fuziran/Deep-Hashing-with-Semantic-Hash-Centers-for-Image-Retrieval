@@ -303,6 +303,100 @@ def loss_is_not_worse(final_loss, reference_loss, atol=1e-7, rtol=1e-6):
     tolerance = atol + rtol * abs(reference_value)
     return final_value <= reference_value + tolerance
 
+
+def select_monotonic_discrete_update(
+    centers,
+    center_index,
+    gradient,
+    similarity,
+    min_distance,
+    improvement_tolerance=1e-7,
+):
+    """Find the best feasible descent candidate induced by one center update.
+
+    A fixed projected-gradient step can leave every bit unchanged when the
+    gradient does not cross the sign threshold.  Enumerating all distinct
+    prefix projections along the descent direction removes that scale
+    dependency.  Single-bit candidates provide a deterministic coordinate
+    descent fallback.  The returned candidate is accepted only when it lowers
+    the exact semantic objective and preserves the minimum Hamming distance.
+    """
+    bit, num_classes = centers.shape
+    current = centers[:, center_index]
+    aligned = current * gradient > 0
+    candidate_rows = []
+
+    if torch.any(aligned):
+        aligned_indices = torch.where(aligned)[0]
+        strengths = gradient[aligned_indices].abs()
+        order = torch.argsort(strengths, descending=True, stable=True)
+        ordered_indices = aligned_indices[order]
+        ordered_strengths = strengths[order]
+        projected = current.clone()
+        start = 0
+        while start < ordered_indices.numel():
+            end = start + 1
+            while (
+                end < ordered_indices.numel()
+                and ordered_strengths[end] == ordered_strengths[start]
+            ):
+                end += 1
+            projected[ordered_indices[start:end]] *= -1
+            candidate_rows.append(projected.clone())
+            start = end
+
+    for bit_index in range(bit):
+        candidate = current.clone()
+        candidate[bit_index] *= -1
+        candidate_rows.append(candidate)
+
+    candidates = torch.unique(torch.stack(candidate_rows), dim=0)
+    correlations = candidates @ centers / bit
+    correlations[:, center_index] = 1.0
+    target_row = similarity[center_index]
+    candidate_row_errors = ((target_row[None, :] - correlations) ** 2).sum(dim=1)
+
+    current_correlations = current @ centers / bit
+    current_correlations[center_index] = 1.0
+    current_row_error = ((target_row - current_correlations) ** 2).sum()
+
+    distances = (bit - candidates @ centers) / 2
+    distances[:, center_index] = float("inf")
+    feasible = distances.amin(dim=1) >= min_distance
+    improving = candidate_row_errors < current_row_error - improvement_tolerance
+    eligible = feasible & improving
+
+    diagnostics = {
+        "candidate_count": int(candidates.shape[0]),
+        "constraint_rejections": int((~feasible).sum().item()),
+        "loss_rejections": int((feasible & ~improving).sum().item()),
+        "gradient_abs_mean": float(gradient.abs().mean().item()),
+        "gradient_abs_max": float(gradient.abs().max().item()),
+        "accepted": False,
+        "flipped_bits": 0,
+        "loss_delta": 0.0,
+    }
+    if not torch.any(eligible):
+        return current.clone(), diagnostics
+
+    eligible_errors = candidate_row_errors.masked_fill(~eligible, float("inf"))
+    selected_index = int(torch.argmin(eligible_errors).item())
+    selected = candidates[selected_index]
+    # Each off-diagonal entry occurs in both the row and column of symmetric S.
+    loss_delta = (
+        2
+        * (candidate_row_errors[selected_index] - current_row_error)
+        / (num_classes ** 2)
+    )
+    diagnostics.update(
+        {
+            "accepted": True,
+            "flipped_bits": int((selected != current).sum().item()),
+            "loss_delta": float(loss_delta.item()),
+        }
+    )
+    return selected, diagnostics
+
 def GetMinimalDistanceHashCenter(args):
     metadata = build_cache_metadata(args, "mds")
     cache_path = os.path.join(
@@ -401,8 +495,14 @@ def GenerateSemanticHashCenters(args, S):
         (args.num_classes, args.num_classes), 1e-6,
         device=device, dtype=torch.float32,
     )
-    eta = 0.5  # 不同数据集这个参数影响挺大的，可以多调调
-    print('eta: ', eta)
+    center_update_strategy = getattr(
+        args, "center_update_strategy", "monotonic_discrete_search"
+    )
+    if center_update_strategy != "monotonic_discrete_search":
+        raise ValueError(
+            f"Unsupported center update strategy: {center_update_strategy}"
+        )
+    print('center update strategy: ', center_update_strategy)
     epochs = 20
     inner_epochs = 3
 
@@ -431,7 +531,12 @@ def GenerateSemanticHashCenters(args, S):
             "attempted_updates": 0,
             "accepted_updates": 0,
             "constraint_rejections": 0,
+            "loss_rejections": 0,
             "unchanged_updates": 0,
+            "candidate_evaluations": 0,
+            "flipped_bits": 0,
+            "gradient_abs_mean": 0.0,
+            "gradient_abs_max": 0.0,
             "is_best": True,
         }
     )
@@ -449,7 +554,12 @@ def GenerateSemanticHashCenters(args, S):
         attempted_updates = 0
         accepted_updates = 0
         constraint_rejections = 0
+        loss_rejections = 0
         unchanged_updates = 0
+        candidate_evaluations = 0
+        flipped_bits = 0
+        gradient_abs_mean_sum = 0.0
+        gradient_abs_max = 0.0
         for inner_epoch in range(inner_epochs):
             for i in range(args.num_classes):
                 # i = 99 - i
@@ -471,20 +581,23 @@ def GenerateSemanticHashCenters(args, S):
                         )
                 der = (2 / (args.code_length ** 2) * M @ M.T @ H[:, i] - 2 / args.code_length * M @ S[:, i]) + lambd[:, i] + rho * (H[:, i] - M[:, i]) + sum
 
-                H_tmp = H.clone()
                 attempted_updates += 1
-                projected = torch.sign(H_tmp[:, i] - 1 / eta * der)
-                projected = torch.where(projected == 0, H_tmp[:, i], projected)
-                if torch.equal(projected, H[:, i]):
+                projected, update_diagnostics = select_monotonic_discrete_update(
+                    H, i, der, S, d
+                )
+                candidate_evaluations += update_diagnostics["candidate_count"]
+                constraint_rejections += update_diagnostics["constraint_rejections"]
+                loss_rejections += update_diagnostics["loss_rejections"]
+                gradient_abs_mean_sum += update_diagnostics["gradient_abs_mean"]
+                gradient_abs_max = max(
+                    gradient_abs_max, update_diagnostics["gradient_abs_max"]
+                )
+                if not update_diagnostics["accepted"]:
                     unchanged_updates += 1
                     continue
-                H_tmp[:, i] = projected
-                if pairwise_hamming_distances(H_tmp).min() < d:
-                    constraint_rejections += 1
-                    continue
-                else:
-                    H[:, i] = H_tmp[:, i]
-                    accepted_updates += 1
+                H[:, i] = projected
+                accepted_updates += 1
+                flipped_bits += update_diagnostics["flipped_bits"]
 
         # lambd-step
         for i in range(args.num_classes):
@@ -510,7 +623,14 @@ def GenerateSemanticHashCenters(args, S):
         print(
             'updates: ',
             f'attempted={attempted_updates}, accepted={accepted_updates}, '
-            f'constraint_rejected={constraint_rejections}, unchanged={unchanged_updates}',
+            f'unchanged={unchanged_updates}, candidates={candidate_evaluations}, '
+            f'constraint_rejected={constraint_rejections}, '
+            f'loss_rejected={loss_rejections}, flipped_bits={flipped_bits}',
+        )
+        print(
+            'gradient: ',
+            f'abs_mean={gradient_abs_mean_sum / max(attempted_updates, 1):.8f}, '
+            f'abs_max={gradient_abs_max:.8f}',
         )
         best_H, min_loss, improved = keep_better_centers(
             best_H, min_loss, H, loss1
@@ -527,7 +647,13 @@ def GenerateSemanticHashCenters(args, S):
                 "attempted_updates": attempted_updates,
                 "accepted_updates": accepted_updates,
                 "constraint_rejections": constraint_rejections,
+                "loss_rejections": loss_rejections,
                 "unchanged_updates": unchanged_updates,
+                "candidate_evaluations": candidate_evaluations,
+                "flipped_bits": flipped_bits,
+                "gradient_abs_mean": gradient_abs_mean_sum
+                / max(attempted_updates, 1),
+                "gradient_abs_max": gradient_abs_max,
                 "is_best": improved,
             }
         )

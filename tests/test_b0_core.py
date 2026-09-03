@@ -11,9 +11,13 @@ from GenerateSemanticHashCenters import (
     loss_is_not_worse,
     pair_quadratic_gradient,
     pairwise_hamming_distances,
+    select_monotonic_discrete_update,
     semantic_similarity_loss,
 )
-from GenerateSimilarityMatrix import normalize_and_symmetrize_similarity
+from GenerateSimilarityMatrix import (
+    load_explicit_similarity_cache,
+    normalize_and_symmetrize_similarity,
+)
 from data.data_loader import _split_sha256, _stratified_split_cifar100
 from utils.experiment import build_cache_metadata, load_cache, save_cache
 from utils.tools import _calc_map_for_one_topk
@@ -99,6 +103,67 @@ class TestCenterGradient(unittest.TestCase):
         self.assertTrue(loss_is_not_worse(cpu_recomputed_loss, raw_loss))
         self.assertFalse(loss_is_not_worse(raw_loss + 1e-3, raw_loss))
 
+    def test_monotonic_search_finds_feasible_improvement(self):
+        centers = torch.tensor(
+            [
+                [1.0, 1.0, -1.0],
+                [1.0, 1.0, -1.0],
+                [1.0, -1.0, 1.0],
+                [1.0, -1.0, 1.0],
+            ]
+        )
+        target = centers.clone()
+        target[1, 0] = -1
+        similarity = target.T @ target / target.shape[0]
+        gradient = torch.tensor([0.0, 1.0, 0.0, 0.0])
+
+        candidate, diagnostics = select_monotonic_discrete_update(
+            centers, 0, gradient, similarity, min_distance=1
+        )
+        updated = centers.clone()
+        updated[:, 0] = candidate
+
+        self.assertTrue(diagnostics["accepted"])
+        updated_loss = semantic_similarity_loss(similarity, updated).item()
+        original_loss = semantic_similarity_loss(similarity, centers).item()
+        self.assertLess(updated_loss, original_loss)
+        self.assertAlmostEqual(
+            diagnostics["loss_delta"], updated_loss - original_loss, places=7
+        )
+        self.assertGreaterEqual(pairwise_hamming_distances(updated).min().item(), 1)
+
+    def test_monotonic_search_rejects_non_improving_candidates(self):
+        centers = torch.tensor(
+            [[1.0, 1.0], [1.0, -1.0], [1.0, 1.0], [1.0, -1.0]]
+        )
+        similarity = centers.T @ centers / centers.shape[0]
+        gradient = torch.tensor([1.0, 0.0, 0.0, 0.0])
+
+        candidate, diagnostics = select_monotonic_discrete_update(
+            centers, 0, gradient, similarity, min_distance=1
+        )
+
+        self.assertFalse(diagnostics["accepted"])
+        self.assertTrue(torch.equal(candidate, centers[:, 0]))
+        self.assertGreater(diagnostics["loss_rejections"], 0)
+
+    def test_monotonic_search_preserves_minimum_distance(self):
+        centers = torch.tensor(
+            [[1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [1.0, 1.0]]
+        )
+        target = centers.clone()
+        target[0, 0] = -1
+        similarity = target.T @ target / target.shape[0]
+        gradient = torch.tensor([1.0, 0.0, 0.0, 0.0])
+
+        candidate, diagnostics = select_monotonic_discrete_update(
+            centers, 0, gradient, similarity, min_distance=2
+        )
+
+        self.assertFalse(diagnostics["accepted"])
+        self.assertTrue(torch.equal(candidate, centers[:, 0]))
+        self.assertGreater(diagnostics["constraint_rejections"], 0)
+
 
 class TestMetrics(unittest.TestCase):
     def test_hand_computed_map(self):
@@ -149,6 +214,32 @@ class TestCacheMetadata(unittest.TestCase):
             mismatched = build_cache_metadata(self._args(40), "similarity")
             with self.assertRaises(RuntimeError):
                 load_cache(path, mismatched)
+
+    def test_explicit_similarity_allows_only_commit_change(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "similarity.pt")
+            source_args = self._args(60)
+            source_args.git_commit = "stage1-commit"
+            metadata = build_cache_metadata(source_args, "similarity")
+            save_cache(path, torch.eye(100), metadata)
+
+            stage2_args = self._args(60)
+            stage2_args.git_commit = "stage2-fix-commit"
+            similarity = load_explicit_similarity_cache(stage2_args, path)
+
+            self.assertTrue(torch.equal(similarity, torch.eye(100)))
+            self.assertEqual(stage2_args.similarity_hash, metadata["config_hash"])
+
+    def test_explicit_similarity_rejects_protocol_change(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "similarity.pt")
+            source_args = self._args(60)
+            metadata = build_cache_metadata(source_args, "similarity")
+            save_cache(path, torch.eye(100), metadata)
+
+            mismatched = self._args(40)
+            with self.assertRaises(RuntimeError):
+                load_explicit_similarity_cache(mismatched, path)
 
 
 if __name__ == "__main__":

@@ -9,7 +9,12 @@ import torch.optim as optim
 import torch.optim.lr_scheduler as lr_scheduler
 
 from network import ClassifyNet
-from utils.experiment import build_cache_metadata, load_cache, save_cache
+from utils.experiment import (
+    build_cache_metadata,
+    load_cache,
+    save_cache,
+    stable_config_hash,
+)
 
 
 def normalize_and_symmetrize_similarity(class_average, eps=1e-12):
@@ -133,7 +138,65 @@ def _similarity_cache(args):
     return path, metadata
 
 
+def load_explicit_similarity_cache(args, path):
+    """Load an audited Stage 1 artifact across a Stage 2-only code revision."""
+    payload = torch.load(path, map_location="cpu")
+    if not isinstance(payload, dict) or set(("value", "metadata")) - set(payload):
+        raise RuntimeError(f"Invalid explicit similarity cache: {path}")
+    metadata = payload["metadata"]
+    if not isinstance(metadata, dict):
+        raise RuntimeError(f"Invalid similarity cache metadata: {path}")
+    stored_without_hash = dict(metadata)
+    stored_hash = stored_without_hash.pop("config_hash", None)
+    if stored_hash != stable_config_hash(stored_without_hash):
+        raise RuntimeError(f"Similarity cache metadata hash is invalid: {path}")
+
+    expected = build_cache_metadata(args, "similarity")
+    provenance_fields = {"git_commit", "config_hash"}
+    mismatches = {
+        key: (expected[key], metadata.get(key))
+        for key in expected.keys() - provenance_fields
+        if expected[key] != metadata.get(key)
+    }
+    if mismatches:
+        raise RuntimeError(
+            f"Explicit similarity cache is incompatible: {path}\n"
+            f"mismatches={mismatches}"
+        )
+
+    similarity = payload["value"]
+    expected_shape = (args.num_classes, args.num_classes)
+    if not isinstance(similarity, torch.Tensor) or similarity.shape != expected_shape:
+        raise RuntimeError(
+            f"Similarity cache shape mismatch: expected={expected_shape}, "
+            f"actual={getattr(similarity, 'shape', None)}"
+        )
+    if not torch.isfinite(similarity).all():
+        raise RuntimeError("Explicit similarity cache contains NaN or Inf")
+    if similarity.min() < -1.000001 or similarity.max() > 1.000001:
+        raise RuntimeError("Explicit similarity cache values are outside [-1, 1]")
+    if not torch.allclose(similarity, similarity.T, atol=1e-7, rtol=1e-6):
+        raise RuntimeError("Explicit similarity cache is not symmetric")
+    expected_diagonal = torch.ones(
+        args.num_classes, dtype=similarity.dtype, device=similarity.device
+    )
+    if not torch.allclose(
+        similarity.diag(), expected_diagonal, atol=1e-7, rtol=1e-6
+    ):
+        raise RuntimeError("Explicit similarity cache diagonal is not one")
+
+    args.similarity_hash = stored_hash
+    print(f"Loaded explicit audited similarity cache: {path}")
+    print(
+        "Similarity provenance: "
+        f"git_commit={metadata.get('git_commit')} config_hash={stored_hash}"
+    )
+    return similarity
+
+
 def GenerateSimilarityMatrix(args, train_loader, relation_loader, val_loader):
+    if args.similarity_cache:
+        return load_explicit_similarity_cache(args, args.similarity_cache)
     cache_path, metadata = _similarity_cache(args)
     args.similarity_hash = metadata["config_hash"]
     if not args.force_recompute:
