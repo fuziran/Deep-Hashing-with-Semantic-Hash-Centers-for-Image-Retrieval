@@ -68,6 +68,7 @@ def TrainClassificationNetwork(args, train_loader, val_loader):
     scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.classify_epoch)
     best_accuracy = float("-inf")
     best_state = copy.deepcopy(net.state_dict())
+    final_state = None
     history = []
 
     for epoch in range(args.classify_epoch):
@@ -114,17 +115,30 @@ def TrainClassificationNetwork(args, train_loader, val_loader):
                 f"validation={val_accuracy:.4%} best={best_accuracy:.4%}"
             )
 
-    best_state = {key: value.detach().cpu() for key, value in best_state.items()}
-    save_cache(cache_path, best_state, metadata)
+        if epoch + 1 == args.classify_epoch:
+            final_state = copy.deepcopy(net.state_dict())
+
+    paper_repro = getattr(args, "protocol", "audited_b0") == "paper_repro"
+    selected_state = final_state if paper_repro else best_state
+    selected_state = {
+        key: value.detach().cpu() for key, value in selected_state.items()
+    }
+    save_cache(cache_path, selected_state, metadata)
     with open(
         os.path.join(args.run_dir, "classification_history.json"),
         "w",
         encoding="utf-8",
     ) as f:
         json.dump(history, f, ensure_ascii=False, indent=2)
-    net.load_state_dict(best_state)
+    net.load_state_dict(selected_state)
     net.to(args.device)
-    print(f"Best classifier validation accuracy: {best_accuracy:.4%}")
+    if paper_repro:
+        print(
+            "Paper protocol classifier uses the final epoch; "
+            f"best query accuracy observed during training={best_accuracy:.4%} (oracle diagnostic)"
+        )
+    else:
+        print(f"Best classifier validation accuracy: {best_accuracy:.4%}")
     return net
 
 

@@ -483,8 +483,23 @@ def GenerateSemanticHashCenters(args, S):
     K = args.code_length - 2 * d - H.T @ H
     K.fill_diagonal_(0)
 
-    lambd = torch.zeros(
-        args.code_length, args.num_classes, device=device, dtype=torch.float32
+    center_update_strategy = getattr(
+        args, "center_update_strategy", "monotonic_discrete_search"
+    )
+    if center_update_strategy not in {
+        "paper_projected_gradient",
+        "monotonic_discrete_search",
+    }:
+        raise ValueError(
+            f"Unsupported center update strategy: {center_update_strategy}"
+        )
+    # Algorithm 1 initializes lambda to 0.1; the audited B0 repair uses zero.
+    lambda_initial = 0.1 if center_update_strategy == "paper_projected_gradient" else 0.0
+    lambd = torch.full(
+        (args.code_length, args.num_classes),
+        lambda_initial,
+        device=device,
+        dtype=torch.float32,
     )
     rho = 0.2
     miu = 0.625
@@ -495,19 +510,17 @@ def GenerateSemanticHashCenters(args, S):
         (args.num_classes, args.num_classes), 1e-6,
         device=device, dtype=torch.float32,
     )
-    center_update_strategy = getattr(
-        args, "center_update_strategy", "monotonic_discrete_search"
-    )
-    if center_update_strategy != "monotonic_discrete_search":
-        raise ValueError(
-            f"Unsupported center update strategy: {center_update_strategy}"
-        )
     print('center update strategy: ', center_update_strategy)
     epochs = 20
     inner_epochs = 3
+    eta = 0.5
 
     loss1 = semantic_similarity_loss(S, H).item()
-    min_loss = loss1
+    min_loss = (
+        float("inf")
+        if center_update_strategy == "paper_projected_gradient"
+        else loss1
+    )
     best_H = H.clone()
     best_epoch = -1
     center_history = []
@@ -537,7 +550,7 @@ def GenerateSemanticHashCenters(args, S):
             "flipped_bits": 0,
             "gradient_abs_mean": 0.0,
             "gradient_abs_max": 0.0,
-            "is_best": True,
+            "is_best": center_update_strategy != "paper_projected_gradient",
         }
     )
 
@@ -579,12 +592,35 @@ def GenerateSemanticHashCenters(args, S):
                                 * H[:, j]
                             )
                         )
+                if center_update_strategy == "paper_projected_gradient":
+                    # The released implementation scales this pairwise term by C^2.
+                    sum /= args.num_classes ** 2
                 der = (2 / (args.code_length ** 2) * M @ M.T @ H[:, i] - 2 / args.code_length * M @ S[:, i]) + lambd[:, i] + rho * (H[:, i] - M[:, i]) + sum
 
                 attempted_updates += 1
-                projected, update_diagnostics = select_monotonic_discrete_update(
-                    H, i, der, S, d
-                )
+                if center_update_strategy == "paper_projected_gradient":
+                    projected = torch.sign(H[:, i] - der / eta)
+                    projected = torch.where(projected == 0, H[:, i], projected)
+                    candidate = H.clone()
+                    candidate[:, i] = projected
+                    violates_distance = (
+                        pairwise_hamming_distances(candidate).min().item() < d
+                    )
+                    changed_bits = int((projected != H[:, i]).sum().item())
+                    accepted = not violates_distance and changed_bits > 0
+                    update_diagnostics = {
+                        "candidate_count": 1,
+                        "constraint_rejections": int(violates_distance),
+                        "loss_rejections": 0,
+                        "gradient_abs_mean": float(der.abs().mean().item()),
+                        "gradient_abs_max": float(der.abs().max().item()),
+                        "accepted": accepted,
+                        "flipped_bits": changed_bits if accepted else 0,
+                    }
+                else:
+                    projected, update_diagnostics = select_monotonic_discrete_update(
+                        H, i, der, S, d
+                    )
                 candidate_evaluations += update_diagnostics["candidate_count"]
                 constraint_rejections += update_diagnostics["constraint_rejections"]
                 loss_rejections += update_diagnostics["loss_rejections"]
@@ -680,7 +716,7 @@ def GenerateSemanticHashCenters(args, S):
         raise RuntimeError(
             f"Saved SHC centers violate minimum distance: {gen_min_d.item()} < {d}"
         )
-    if not loss_is_not_worse(
+    if center_update_strategy == "monotonic_discrete_search" and not loss_is_not_worse(
         similarity_match.item(), center_history[0]["similarity_loss"]
     ):
         raise RuntimeError("Saved SHC centers are worse than the raw MDS centers")

@@ -20,7 +20,13 @@ from utils.experiment import (
 
 
 def load_config():
-    parser = argparse.ArgumentParser(description="Faithful and auditable SHC B0 baseline")
+    parser = argparse.ArgumentParser(description="SHC paper-protocol reproduction")
+    parser.add_argument(
+        "--protocol",
+        choices=("paper_repro", "audited_b0"),
+        default="paper_repro",
+        help="Published 10k/query-oracle protocol or the leakage-free audited B0.",
+    )
     parser.add_argument("--seed", default=60, type=int)
     parser.add_argument("--info", default="[SHC-B0]", type=str)
     parser.add_argument("--dataset", default="cifar-100-new-seg", type=str)
@@ -40,7 +46,7 @@ def load_config():
     parser.add_argument("--crop-size", default=224, type=int)
     parser.add_argument("--gpu", default=0, type=int)
     parser.add_argument("--cpu", action="store_true")
-    parser.add_argument("--val-per-class", default=10, type=int)
+    parser.add_argument("--val-per-class", default=0, type=int)
     parser.add_argument(
         "--mask-strategy",
         choices=("predicted_argmax", "ground_truth"),
@@ -49,9 +55,9 @@ def load_config():
     )
     parser.add_argument(
         "--center-update-strategy",
-        choices=("monotonic_discrete_search",),
-        default="monotonic_discrete_search",
-        help="Deterministic Stage 2 update with loss and distance safeguards.",
+        choices=("paper_projected_gradient", "monotonic_discrete_search"),
+        default="paper_projected_gradient",
+        help="Paper Algorithm 1 update or the repaired audited B0 update.",
     )
     parser.add_argument(
         "--stage",
@@ -75,6 +81,11 @@ def load_config():
 
     if args.force_recompute and args.similarity_cache:
         parser.error("--force-recompute and --similarity-cache cannot be used together")
+
+    if args.protocol == "paper_repro" and args.val_per_class != 0:
+        parser.error("paper_repro requires --val-per-class 0 (10,000 training images)")
+    if args.protocol == "audited_b0" and args.val_per_class <= 0:
+        parser.error("audited_b0 requires a positive --val-per-class")
 
     if len(args.topK) != 3:
         parser.error("--topK must contain exactly: -1 100 1000")
@@ -108,6 +119,7 @@ def main():
     ) = load_data(args)
 
     run_config = {
+        "protocol": args.protocol,
         "dataset": args.dataset,
         "seed": args.seed,
         "split_sha256": args.split_hash,
@@ -125,7 +137,7 @@ def main():
     args.run_dir = os.path.join(
         args.output_dir,
         "runs",
-        f"{args.dataset}_B0_{args.code_length}bit_seed{args.seed}_{args.run_id}",
+        f"{args.dataset}_{args.protocol}_{args.code_length}bit_seed{args.seed}_{args.run_id}",
     )
     write_run_manifest(args)
 

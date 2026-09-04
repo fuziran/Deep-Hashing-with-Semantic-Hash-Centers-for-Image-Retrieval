@@ -36,9 +36,21 @@ def current_git_commit():
         return "unknown"
 
 
+def file_sha256(path, chunk_size=1024 * 1024):
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        while True:
+            chunk = stream.read(chunk_size)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def build_cache_metadata(args, stage):
     metadata = {
         "stage": stage,
+        "protocol": getattr(args, "protocol", "audited_b0"),
         "dataset": args.dataset,
         "seed": args.seed,
         "split_sha256": args.split_hash,
@@ -100,6 +112,16 @@ def write_run_manifest(args):
     manifest["cublas_workspace_config"] = os.environ.get(
         "CUBLAS_WORKSPACE_CONFIG"
     )
+    local_weight_path = "./models_ckpt/resnet34-b627a593.pth"
+    if os.path.exists(local_weight_path):
+        manifest["pretrained_weights"] = {
+            "path": os.path.abspath(local_weight_path),
+            "sha256": file_sha256(local_weight_path),
+        }
+    else:
+        manifest["pretrained_weights"] = (
+            "torchvision.models.ResNet34_Weights.IMAGENET1K_V1"
+        )
     if torch.cuda.is_available():
         manifest["gpu"] = torch.cuda.get_device_name(args.device)
     with open(os.path.join(args.run_dir, "config.json"), "w", encoding="utf-8") as f:

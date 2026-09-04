@@ -46,6 +46,17 @@ class TestCifarSplit(unittest.TestCase):
         second = _stratified_split_cifar100(self.labels, seed=60, val_per_class=10)
         self.assertEqual(_split_sha256(*first), _split_sha256(*second))
 
+    def test_paper_protocol_counts(self):
+        train, validation, query, database = _stratified_split_cifar100(
+            self.labels, seed=60, val_per_class=0
+        )
+        self.assertEqual(
+            (len(train), len(validation), len(query), len(database)),
+            (10000, 0, 5000, 45000),
+        )
+        combined = np.concatenate((train, query, database))
+        self.assertEqual(len(np.unique(combined)), 60000)
+
 
 class TestSimilarityMatrix(unittest.TestCase):
     def test_paper_order_invariants(self):
@@ -192,6 +203,7 @@ class TestMetrics(unittest.TestCase):
 class TestCacheMetadata(unittest.TestCase):
     def _args(self, seed):
         return argparse.Namespace(
+            protocol="audited_b0",
             dataset="cifar-100-new-seg",
             seed=seed,
             split_hash="split",
@@ -212,6 +224,18 @@ class TestCacheMetadata(unittest.TestCase):
             metadata = build_cache_metadata(self._args(60), "similarity")
             save_cache(path, torch.ones(2), metadata)
             mismatched = build_cache_metadata(self._args(40), "similarity")
+            with self.assertRaises(RuntimeError):
+                load_cache(path, mismatched)
+
+    def test_protocol_change_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "cache.pt")
+            audited_args = self._args(60)
+            metadata = build_cache_metadata(audited_args, "similarity")
+            save_cache(path, torch.ones(2), metadata)
+            paper_args = self._args(60)
+            paper_args.protocol = "paper_repro"
+            mismatched = build_cache_metadata(paper_args, "similarity")
             with self.assertRaises(RuntimeError):
                 load_cache(path, mismatched)
 

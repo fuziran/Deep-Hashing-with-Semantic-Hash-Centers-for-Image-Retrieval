@@ -128,6 +128,8 @@ def train_val(
     best_epoch = 0
     best_state = {key: value.detach().cpu() for key, value in net.state_dict().items()}
     history, losses, learning_rates = [], [], []
+    paper_repro = getattr(args, "protocol", "audited_b0") == "paper_repro"
+    oracle_best = {"mAP@ALL": float("-inf"), "mAP@100": float("-inf"), "mAP@1000": float("-inf")}
 
     for epoch in range(args.epoch):
         started = time.time()
@@ -160,7 +162,9 @@ def train_val(
             validation_metrics, _, _, _, _, _ = _evaluate(
                 val_loader, database_loader, net, args, num_database
             )
-            record["validation"] = validation_metrics
+            record["query_oracle" if paper_repro else "validation"] = validation_metrics
+            for metric_name, metric_value in validation_metrics.items():
+                oracle_best[metric_name] = max(oracle_best[metric_name], metric_value)
             if validation_metrics["mAP@ALL"] > best_validation_map:
                 best_validation_map = validation_metrics["mAP@ALL"]
                 best_epoch = epoch + 1
@@ -169,9 +173,9 @@ def train_val(
                 }
             print(
                 f"{args.info} epoch={epoch + 1} loss={epoch_loss:.5f} "
-                f"val_ALL={validation_metrics['mAP@ALL']:.5f} "
-                f"val_100={validation_metrics['mAP@100']:.5f} "
-                f"val_1000={validation_metrics['mAP@1000']:.5f}"
+                f"{'query_oracle' if paper_repro else 'val'}_ALL={validation_metrics['mAP@ALL']:.5f} "
+                f"{'query_oracle' if paper_repro else 'val'}_100={validation_metrics['mAP@100']:.5f} "
+                f"{'query_oracle' if paper_repro else 'val'}_1000={validation_metrics['mAP@1000']:.5f}"
             )
         else:
             print(f"{args.info} epoch={epoch + 1} loss={epoch_loss:.5f}")
@@ -191,10 +195,18 @@ def train_val(
     )
     summary = {
         "selected_epoch": best_epoch,
-        "selection_metric": "validation mAP@ALL",
-        "best_validation_mAP@ALL": best_validation_map,
+        "selection_metric": (
+            "query mAP@ALL (legacy oracle)" if paper_repro else "validation mAP@ALL"
+        ),
+        "best_selection_mAP@ALL": best_validation_map,
         "query_metrics": final_metrics,
     }
+    if paper_repro:
+        summary["paper_table_oracle_metrics"] = oracle_best
+        summary["warning"] = (
+            "The query set was evaluated repeatedly during training, matching the "
+            "released protocol. These oracle metrics must not be used for fair innovation claims."
+        )
 
     os.makedirs(args.run_dir, exist_ok=True)
     torch.save(best_state, os.path.join(args.run_dir, "best_model_state.pt"))

@@ -49,9 +49,9 @@ def _load_cifar100_raw(root):
 
 
 def _stratified_split_cifar100(labels, seed=60, val_per_class=10):
-    """Create a fixed B0 split and keep the query set final-evaluation only."""
-    if not 0 < val_per_class < 100:
-        raise ValueError("val_per_class must be between 1 and 99")
+    """Create the published 10k/5k/45k split or the audited B0 split."""
+    if not 0 <= val_per_class < 100:
+        raise ValueError("val_per_class must be between 0 and 99")
 
     rng = np.random.RandomState(seed)
     train_indices, val_indices = [], []
@@ -202,8 +202,15 @@ def load_data(args):
         train_dataset, shuffle=True, generator=generator, **common_loader_args
     )
     relation_loader = DataLoader(relation_dataset, shuffle=False, **common_loader_args)
-    val_loader = DataLoader(val_dataset, shuffle=False, **common_loader_args)
     query_loader = DataLoader(query_dataset, shuffle=False, **common_loader_args)
+    if getattr(args, "protocol", "audited_b0") == "paper_repro":
+        if len(val_dataset) != 0:
+            raise RuntimeError("paper_repro requires --val-per-class 0")
+        # The released implementation evaluates on the query set during training.
+        # We expose that behavior explicitly and label it as an oracle downstream.
+        val_loader = query_loader
+    else:
+        val_loader = DataLoader(val_dataset, shuffle=False, **common_loader_args)
     database_loader = DataLoader(database_dataset, shuffle=False, **common_loader_args)
 
     print("========== CIFAR-100 dataset loaded ==========")

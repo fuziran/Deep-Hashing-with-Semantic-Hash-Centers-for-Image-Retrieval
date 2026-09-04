@@ -79,10 +79,55 @@ Run a one-epoch smoke test first:
 ```bash
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
 python3 run.py --dataset cifar-100-new-seg \
+  --protocol audited_b0 --val-per-class 10 \
+  --center-update-strategy monotonic_discrete_search \
   --root ./data/cifar-100-python \
   --num-classes 100 --code-length 32 --seed 60 \
   --classify-epoch 1 --epoch 1 --test-map 1 \
   --batch-size 64 --num-workers 4 --topK -1 100 1000
+```
+
+### Paper-protocol reproduction branch
+
+Branch `baseline-run-0904` defaults to the protocol described by the paper and
+mirrored by the released training loop: 10,000 training images, 5,000 query
+images and 45,000 retrieval images for CIFAR-100. No validation samples are
+removed from the 10,000-image training pool. The paper-formula Stage 1 mask and
+the projected-gradient Stage 2 update are the defaults.
+
+The released training loop evaluates the query set every five epochs. This
+branch preserves that behavior only for reproduction and labels all such values
+as `query_oracle` / `paper_table_oracle_metrics`. They must not be used as the
+main evidence for later innovation claims.
+
+Run a one-epoch protocol smoke test before the 300-epoch reproduction:
+
+```bash
+python run.py --protocol paper_repro --val-per-class 0 \
+  --dataset cifar-100-new-seg --root ./data/cifar-100-python \
+  --num-classes 100 --code-length 32 --seed 60 \
+  --classify-epoch 1 --epoch 1 --test-map 1 \
+  --batch-size 64 --topK -1 100 1000 --force-recompute
+```
+
+For the formal run, restore both epoch counts to 300 and remove
+`--force-recompute` after the intended caches have been generated. Because the
+paper does not publish its exact random CIFAR-100 sample manifest, matching the
+10,000/5,000/45,000 counts does not establish an identical split; the saved
+split SHA256 is therefore part of every reported result.
+
+Formal CIFAR-100 32-bit reproduction command:
+
+```bash
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
+python run.py --protocol paper_repro --val-per-class 0 \
+  --center-update-strategy paper_projected_gradient \
+  --mask-strategy predicted_argmax \
+  --dataset cifar-100-new-seg --root ./data/cifar-100-python \
+  --num-classes 100 --code-length 32 --seed 60 \
+  --classify-epoch 300 --epoch 300 --test-map 5 \
+  --lr 7e-5 --lambd 1e-4 --batch-size 64 \
+  --num-workers 6 --topK -1 100 1000
 ```
 
 For the reported B0 result, restore both epoch counts to 300. Splits, cache
