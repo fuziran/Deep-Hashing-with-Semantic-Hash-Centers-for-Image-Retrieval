@@ -27,11 +27,35 @@ def stable_config_hash(config, length=12):
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:length]
 
 
+def state_dict_sha256(state_dict):
+    digest = hashlib.sha256()
+    for key in sorted(state_dict):
+        value = state_dict[key].detach().cpu().contiguous()
+        digest.update(key.encode("utf-8"))
+        digest.update(str(value.dtype).encode("ascii"))
+        digest.update(str(tuple(value.shape)).encode("ascii"))
+        digest.update(value.numpy().tobytes())
+    return digest.hexdigest()
+
+
 def current_git_commit():
     try:
-        return subprocess.check_output(
+        commit = subprocess.check_output(
             ["git", "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL
         ).strip()
+        tracked_dirty = any(
+            subprocess.call(
+                command,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            != 0
+            for command in (
+                ["git", "diff", "--quiet"],
+                ["git", "diff", "--cached", "--quiet"],
+            )
+        )
+        return f"{commit}-dirty" if tracked_dirty else commit
     except (OSError, subprocess.CalledProcessError):
         return "unknown"
 
@@ -56,6 +80,18 @@ def build_cache_metadata(args, stage):
         )
     if stage in {"similarity", "centers"}:
         metadata["mask_strategy"] = args.mask_strategy
+    method = getattr(args, "method", "B0")
+    if stage == "similarity" and method != "B0":
+        metadata.update(
+            {
+                "method": method,
+                "classifier_sha256": getattr(args, "classifier_sha256", "unknown"),
+                "rsm_views": args.rsm_views,
+                "rsm_temperature_grid": list(args.rsm_temperature_grid),
+                "rsm_confusion_alpha": args.rsm_confusion_alpha,
+                "rsm_view_transform": "deterministic_resize_crop_flip_v1",
+            }
+        )
     if stage == "centers":
         metadata["similarity_config_hash"] = args.similarity_hash
         metadata["center_update_strategy"] = getattr(

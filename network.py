@@ -142,11 +142,15 @@ class ClassifyNet(nn.Module):
         # self.layer_hash.bias.data.fill_(0.0)
         # self.hash_layer = nn.Sequential(self.layer_hash, nn.BatchNorm1d(hash_bit, momentum=0.1))
 
-    def forward(self, x):
+    def forward_features(self, x):
+        """Return classifier logits and penultimate features for Stage 1 methods."""
+        features = self.feature_layers(x)
+        features = features.view(features.size(0), -1)
+        logits = self.classify_layer(features)
+        return logits, features
 
-        x = self.feature_layers(x)
-        x = x.view(x.size(0), -1)
-        x = self.classify_layer(x)
+    def forward(self, x):
+        x, _ = self.forward_features(x)
         y = self.softmax(x)
         # x = self.tanh(x)
         return x, y

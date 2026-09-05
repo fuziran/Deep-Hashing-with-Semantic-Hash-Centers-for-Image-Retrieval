@@ -8,6 +8,7 @@ import torch
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
+from torchvision.transforms import functional as TF
 
 
 def _unpickle(file_path):
@@ -142,6 +143,58 @@ class CIFAR100HashDataset(Dataset):
         return image, label, torch.tensor(real_idx, dtype=torch.long)
 
 
+class DeterministicWeakMultiViewTransform:
+    """Create reproducible weak views keyed by sample index and view number."""
+
+    def __init__(self, resize_size, crop_size, num_views, seed, normalize):
+        if num_views < 1:
+            raise ValueError("num_views must be at least one")
+        if crop_size > resize_size:
+            raise ValueError("crop_size cannot exceed resize_size")
+        self.resize_size = resize_size
+        self.crop_size = crop_size
+        self.num_views = num_views
+        self.seed = seed
+        self.normalize = normalize
+
+    def __call__(self, image, sample_index):
+        resized = TF.resize(image, [self.resize_size, self.resize_size])
+        max_offset = self.resize_size - self.crop_size
+        views = []
+        for view_index in range(self.num_views):
+            generator = torch.Generator()
+            generator.manual_seed(
+                int(self.seed) * 1_000_003
+                + int(sample_index) * 9_973
+                + view_index * 101
+            )
+            if max_offset:
+                top = int(torch.randint(max_offset + 1, (1,), generator=generator))
+                left = int(torch.randint(max_offset + 1, (1,), generator=generator))
+            else:
+                top = left = 0
+            view = TF.crop(resized, top, left, self.crop_size, self.crop_size)
+            if bool(torch.randint(2, (1,), generator=generator)):
+                view = TF.hflip(view)
+            view = self.normalize(TF.to_tensor(view))
+            views.append(view)
+        return torch.stack(views, dim=0)
+
+
+class CIFAR100MultiViewDataset(CIFAR100HashDataset):
+    def __init__(self, *args, multiview_transform, **kwargs):
+        super().__init__(*args, transform=None, **kwargs)
+        self.multiview_transform = multiview_transform
+
+    def __getitem__(self, item):
+        real_idx = int(self.indices[item])
+        image = Image.fromarray(self.images[real_idx])
+        views = self.multiview_transform(image, real_idx)
+        label = torch.zeros(self.num_classes, dtype=torch.float32)
+        label[int(self.labels[real_idx])] = 1.0
+        return views, label, torch.tensor(real_idx, dtype=torch.long)
+
+
 def load_data(args):
     if "cifar" not in args.dataset.lower():
         raise NotImplementedError(
@@ -184,7 +237,23 @@ def load_data(args):
         )
 
     train_dataset = make_dataset(train_idx, train_transform)
-    relation_dataset = make_dataset(train_idx, eval_transform)
+    if getattr(args, "method", "B0") == "B0":
+        relation_dataset = make_dataset(train_idx, eval_transform)
+    else:
+        multiview_transform = DeterministicWeakMultiViewTransform(
+            args.resize_size,
+            args.crop_size,
+            args.rsm_views,
+            args.seed,
+            normalize,
+        )
+        relation_dataset = CIFAR100MultiViewDataset(
+            images,
+            labels,
+            train_idx,
+            args.num_classes,
+            multiview_transform=multiview_transform,
+        )
     val_dataset = make_dataset(val_idx, eval_transform)
     query_dataset = make_dataset(query_idx, eval_transform)
     database_dataset = make_dataset(database_idx, eval_transform)

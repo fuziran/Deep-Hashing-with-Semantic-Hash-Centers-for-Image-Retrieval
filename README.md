@@ -85,6 +85,35 @@ python3 run.py --dataset cifar-100-new-seg \
   --batch-size 64 --num-workers 4 --topK -1 100 1000
 ```
 
+### RSM B1 development (CIFAR-100, 32 bit)
+
+Keep the audited B0 classifier fixed for every A1/A2/A3/B1 run. During
+development the query set is not evaluated; checkpoints are selected only by
+validation `mAP@ALL`.
+
+```bash
+python3 run.py --method B1 --dataset cifar-100-new-seg \
+  --root ./data/cifar-100-python --num-classes 100 \
+  --code-length 32 --seed 60 --classify-epoch 300 --epoch 300 \
+  --classifier-cache ./save/ClassificationNet/AUDITED_B0_CLASSIFIER.pt \
+  --rsm-views 4 --rsm-temperature-grid 0.7 1.0 1.5 2.0 \
+  --rsm-confusion-alpha 0.7 --topK -1 100 1000
+```
+
+After the B1 configuration is frozen, evaluate its validation-selected
+checkpoint exactly once:
+
+```bash
+python3 run.py --stage evaluate --method B1 \
+  --dataset cifar-100-new-seg --root ./data/cifar-100-python \
+  --num-classes 100 --code-length 32 --seed 60 \
+  --checkpoint ./save/runs/FROZEN_B1_RUN/best_model_state.pt \
+  --topK -1 100 1000
+```
+
+The evaluator records the checkpoint SHA256 and rejects a second query
+evaluation for the same frozen run.
+
 For the reported B0 result, restore both epoch counts to 300. Splits, cache
 metadata, the selected checkpoint, all three mAP values, per-query AP and
 binary codes are written under `save/`. Use `--stage similarity` or

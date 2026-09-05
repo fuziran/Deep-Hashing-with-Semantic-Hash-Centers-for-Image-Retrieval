@@ -13,6 +13,7 @@ import torch.optim as optim
 import torch.optim.lr_scheduler as lr_scheduler
 from scipy.linalg import hadamard
 
+from utils.experiment import state_dict_sha256
 from utils.tools import CalcTopMapPerQuery, CalcTopMapWithPR, compute_result
 
 torch.multiprocessing.set_sharing_strategy("file_system")
@@ -102,16 +103,46 @@ def _save_curves(run_dir, losses, learning_rates):
     plt.close(figure)
 
 
+def validate_frozen_query_protocol(summary, args):
+    if summary.get("query_evaluation_count", 0) != 0:
+        raise RuntimeError(
+            "This frozen run has already been evaluated on the query set; "
+            "a repeated evaluation is rejected"
+        )
+    expected_protocol = {
+        "method": args.method,
+        "dataset": args.dataset,
+        "seed": args.seed,
+        "split_sha256": args.split_hash,
+        "code_length": args.code_length,
+        "topK": args.topK,
+    }
+    mismatches = {
+        key: (summary.get(key), value)
+        for key, value in expected_protocol.items()
+        if summary.get(key) != value
+    }
+    if mismatches:
+        raise RuntimeError(f"Frozen query protocol mismatch: {mismatches}")
+
 def train_val(
     args,
     hash_center,
     train_loader,
     val_loader,
-    query_loader,
     database_loader,
     num_database,
 ):
-    print("========== start SHC B0 network training ==========")
+    print(f"========== start SHC {args.method} network training ==========")
+    existing_metrics_path = os.path.join(args.run_dir, "metrics.json")
+    if os.path.exists(existing_metrics_path):
+        with open(existing_metrics_path, "r", encoding="utf-8") as f:
+            existing_summary = json.load(f)
+        if existing_summary.get("query_evaluation_count", 0) > 0:
+            raise RuntimeError(
+                "Refusing to overwrite a finalized run that has already accessed "
+                "the query set; change the configuration to create a new run"
+            )
     bit = args.code_length
     net = args.net(bit).to(args.device)
     optimizer = optim.RMSprop(net.parameters(), lr=args.lr, weight_decay=1e-5)
@@ -179,7 +210,67 @@ def train_val(
 
     net.load_state_dict(best_state)
     net.to(args.device)
-    final_metrics, pr_data, query_binary, query_label, database_binary, database_label = (
+    summary = {
+        "method": args.method,
+        "dataset": args.dataset,
+        "seed": args.seed,
+        "split_sha256": args.split_hash,
+        "code_length": args.code_length,
+        "topK": args.topK,
+        "classifier_sha256": getattr(args, "classifier_sha256", None),
+        "similarity_config_hash": getattr(args, "similarity_hash", None),
+        "selected_epoch": best_epoch,
+        "selection_metric": "validation mAP@ALL",
+        "best_validation_mAP@ALL": best_validation_map,
+        "best_model_sha256": state_dict_sha256(best_state),
+        "query_metrics": None,
+        "query_evaluation_count": 0,
+    }
+
+    os.makedirs(args.run_dir, exist_ok=True)
+    torch.save(best_state, os.path.join(args.run_dir, "best_model_state.pt"))
+    with open(os.path.join(args.run_dir, "training_history.json"), "w", encoding="utf-8") as f:
+        json.dump(history, f, ensure_ascii=False, indent=2)
+    with open(os.path.join(args.run_dir, "metrics.json"), "w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
+    _save_curves(args.run_dir, losses, learning_rates)
+
+    print(
+        f"Selected epoch {best_epoch} by validation mAP@ALL="
+        f"{best_validation_map:.5f}; query set was not evaluated"
+    )
+    print(f"========== finished SHC {args.method} network training ==========")
+    return summary
+
+
+def evaluate_query_checkpoint(
+    args,
+    checkpoint_path,
+    query_loader,
+    database_loader,
+    num_database,
+):
+    """Evaluate a frozen checkpoint once and persist the auditable query outputs."""
+    checkpoint_path = os.path.abspath(checkpoint_path)
+    run_dir = os.path.dirname(checkpoint_path)
+    metrics_path = os.path.join(run_dir, "metrics.json")
+    if not os.path.exists(metrics_path):
+        raise FileNotFoundError(f"Missing training metrics beside checkpoint: {metrics_path}")
+    with open(metrics_path, "r", encoding="utf-8") as f:
+        summary = json.load(f)
+    validate_frozen_query_protocol(summary, args)
+
+    state = torch.load(checkpoint_path, map_location="cpu")
+    if not isinstance(state, dict) or not state:
+        raise RuntimeError(f"Invalid checkpoint state_dict: {checkpoint_path}")
+    checkpoint_sha256 = state_dict_sha256(state)
+    if checkpoint_sha256 != summary.get("best_model_sha256"):
+        raise RuntimeError(
+            "Checkpoint SHA256 does not match the frozen validation-selected model"
+        )
+    net = args.net(args.code_length).to(args.device)
+    net.load_state_dict(state)
+    metrics, pr_data, query_binary, query_label, database_binary, database_label = (
         _evaluate(query_loader, database_loader, net, args, num_database)
     )
     per_query_ap = CalcTopMapPerQuery(
@@ -189,15 +280,6 @@ def train_val(
         database_label.numpy(),
         args.topK,
     )
-    summary = {
-        "selected_epoch": best_epoch,
-        "selection_metric": "validation mAP@ALL",
-        "best_validation_mAP@ALL": best_validation_map,
-        "query_metrics": final_metrics,
-    }
-
-    os.makedirs(args.run_dir, exist_ok=True)
-    torch.save(best_state, os.path.join(args.run_dir, "best_model_state.pt"))
     torch.save(
         {
             "query_binary": query_binary,
@@ -207,18 +289,16 @@ def train_val(
             "pr_data": pr_data,
             "per_query_ap": per_query_ap,
         },
-        os.path.join(args.run_dir, "retrieval_outputs.pt"),
+        os.path.join(run_dir, "retrieval_outputs.pt"),
     )
-    with open(os.path.join(args.run_dir, "training_history.json"), "w", encoding="utf-8") as f:
-        json.dump(history, f, ensure_ascii=False, indent=2)
-    with open(os.path.join(args.run_dir, "metrics.json"), "w", encoding="utf-8") as f:
+    summary["query_metrics"] = metrics
+    summary["query_evaluation_count"] = 1
+    summary["query_checkpoint_sha256"] = checkpoint_sha256
+    with open(metrics_path, "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
-    _save_curves(args.run_dir, losses, learning_rates)
-
     print(
-        f"Selected epoch {best_epoch}; query mAP@ALL={final_metrics['mAP@ALL']:.5f}, "
-        f"mAP@100={final_metrics['mAP@100']:.5f}, "
-        f"mAP@1000={final_metrics['mAP@1000']:.5f}"
+        f"Final frozen query evaluation: mAP@ALL={metrics['mAP@ALL']:.5f}, "
+        f"mAP@100={metrics['mAP@100']:.5f}, "
+        f"mAP@1000={metrics['mAP@1000']:.5f}"
     )
-    print("========== finished SHC B0 network training ==========")
     return summary
