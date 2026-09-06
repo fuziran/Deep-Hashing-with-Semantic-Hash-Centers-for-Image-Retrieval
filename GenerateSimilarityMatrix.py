@@ -151,6 +151,25 @@ def load_explicit_similarity_cache(args, path):
     if stored_hash != stable_config_hash(stored_without_hash):
         raise RuntimeError(f"Similarity cache metadata hash is invalid: {path}")
 
+    if getattr(args, "variant", "b0") == "b1":
+        from utils.reliable_relation import restore_artifact
+        classifier_digest = metadata.get("classifier_sha256", "")
+        if (not isinstance(classifier_digest, str) or len(classifier_digest) != 64
+                or any(c not in "0123456789abcdef" for c in classifier_digest)):
+            raise RuntimeError("Explicit I1 cache has no valid classifier SHA256")
+        # Explicit artifacts carry their frozen classifier provenance; no retraining.
+        args.classifier_sha256 = classifier_digest
+        expected = build_cache_metadata(args, "similarity")
+        mismatches = {key: (value, metadata.get(key))
+                      for key, value in expected.items()
+                      if key not in {"git_commit", "config_hash"}
+                      and value != metadata.get(key)}
+        if mismatches:
+            raise RuntimeError(f"Explicit I1 cache is incompatible: {mismatches}")
+        return restore_artifact(args, payload["value"], metadata)
+
+    if "relation" in metadata:
+        raise RuntimeError("B0 cannot load an I1 similarity cache")
     expected = build_cache_metadata(args, "similarity")
     provenance_fields = {"git_commit", "config_hash"}
     mismatches = {
@@ -197,6 +216,9 @@ def load_explicit_similarity_cache(args, path):
 def GenerateSimilarityMatrix(args, train_loader, relation_loader, val_loader):
     if args.similarity_cache:
         return load_explicit_similarity_cache(args, args.similarity_cache)
+    if getattr(args, "variant", "b0") == "b1":
+        from utils.reliable_relation import generate_i1
+        return generate_i1(args, train_loader, relation_loader, val_loader)
     cache_path, metadata = _similarity_cache(args)
     args.similarity_hash = metadata["config_hash"]
     if not args.force_recompute:

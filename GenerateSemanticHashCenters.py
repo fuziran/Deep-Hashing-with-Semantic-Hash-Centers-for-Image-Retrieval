@@ -456,6 +456,10 @@ def GetMinimalDistanceHashCenter(args):
 
 def GenerateSemanticHashCenters(args, S):
 
+    if getattr(args, "variant", "b0") == "b1":
+        from utils.reliable_relation import tensor_sha256, validate_similarity
+        validate_similarity(S, args.num_classes)
+        args.similarity_content_sha256 = tensor_sha256(S)
     metadata = build_cache_metadata(args, "centers")
     cache_path = os.path.join(
         args.output_dir,

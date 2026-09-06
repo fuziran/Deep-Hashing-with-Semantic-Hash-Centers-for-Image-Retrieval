@@ -1,4 +1,5 @@
 import argparse
+import math
 import os
 
 # Must be set before the first CUDA BLAS workspace is created.
@@ -15,6 +16,7 @@ from utils.experiment import (
     current_git_commit,
     seed_everything,
     stable_config_hash,
+    source_sha256,
     write_run_manifest,
 )
 
@@ -22,6 +24,15 @@ from utils.experiment import (
 def load_config():
     parser = argparse.ArgumentParser(description="Faithful and auditable SHC B0 baseline")
     parser.add_argument("--seed", default=60, type=int)
+    parser.add_argument("--variant", choices=("b0", "b1"), default="b0")
+    parser.add_argument("--relation-mode",
+                        choices=("full", "two_view", "weighted", "fixed_fusion", "feature_only"),
+                        default="full")
+    parser.add_argument("--relation-kappa", type=float, default=30.0)
+    parser.add_argument("--relation-temperature", type=float, default=1.0)
+    parser.add_argument("--relation-weight-floor", type=float, default=0.05)
+    parser.add_argument("--paired-stage-seeds", action="store_true",
+                        help="Reset hash-stage RNG and training order identically for B0/B1.")
     parser.add_argument("--info", default="[SHC-B0]", type=str)
     parser.add_argument("--dataset", default="cifar-100-new-seg", type=str)
     parser.add_argument("--num-classes", default=100, type=int)
@@ -73,6 +84,20 @@ def load_config():
     )
     args = parser.parse_args()
 
+    for name in ("relation_kappa", "relation_temperature", "relation_weight_floor"):
+        value = getattr(args, name)
+        if not math.isfinite(value) or value <= 0:
+            parser.error(f"--{name.replace('_', '-')} must be finite and positive")
+    if args.relation_weight_floor > 1:
+        parser.error("--relation-weight-floor must be <= 1")
+    if args.variant == "b0" and (
+        args.relation_mode != "full" or args.relation_kappa != 30.0
+        or args.relation_temperature != 1.0 or args.relation_weight_floor != 0.05
+    ):
+        parser.error("Relation options require --variant b1")
+    if args.info == "[SHC-B0]":
+        args.info = f"[SHC-{args.variant.upper()}]"
+
     if args.force_recompute and args.similarity_cache:
         parser.error("--force-recompute and --similarity-cache cannot be used together")
 
@@ -88,6 +113,7 @@ def load_config():
         args.device = torch.device(f"cuda:{args.gpu}")
     args.net = ResNet
     args.git_commit = current_git_commit()
+    args.source_sha256 = source_sha256()
     return args
 
 
@@ -121,24 +147,49 @@ def main():
         "validation_per_class": args.val_per_class,
         "git_commit": args.git_commit,
     }
+    if args.variant == "b1":
+        from utils.reliable_relation import relation_config
+        run_config["variant"] = args.variant
+        run_config["relation"] = relation_config(args)
+    if args.paired_stage_seeds:
+        run_config["paired_stage_seeds"] = True
+    if args.variant == "b1" or args.paired_stage_seeds:
+        run_config.update({
+            "source_sha256": args.source_sha256,
+            "batch_size": args.batch_size,
+            "num_workers": args.num_workers,
+            "test_map": args.test_map,
+            "resize_size": args.resize_size,
+            "crop_size": args.crop_size,
+            "beta": args.beta,
+            "lambd": args.lambd,
+            "deterministic": not args.non_deterministic,
+        })
     args.run_id = stable_config_hash(run_config)
     args.run_dir = os.path.join(
         args.output_dir,
         "runs",
-        f"{args.dataset}_B0_{args.code_length}bit_seed{args.seed}_{args.run_id}",
+        f"{args.dataset}_{args.variant.upper()}_{args.code_length}bit_seed{args.seed}_{args.run_id}",
     )
     write_run_manifest(args)
 
     similarity = GenerateSimilarityMatrix(
         args, train_loader, relation_loader, val_loader
     )
+    write_run_manifest(args)
     if args.stage == "similarity":
         return
 
     centers = GenerateSemanticHashCenters(args, similarity.to(args.device))
+    from utils.reliable_relation import tensor_sha256
+    args.center_content_sha256 = tensor_sha256(centers)
+    write_run_manifest(args)
     if args.stage == "centers":
         return
 
+    if args.paired_stage_seeds:
+        seed_everything(args.seed, deterministic=not args.non_deterministic)
+        train_loader.generator.manual_seed(args.seed)
     train_val(
         args,
         centers,

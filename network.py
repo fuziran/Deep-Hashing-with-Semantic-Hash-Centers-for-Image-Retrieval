@@ -151,6 +151,14 @@ class ClassifyNet(nn.Module):
         # x = self.tanh(x)
         return x, y
 
+    def forward_features(self, x):
+        """Return pooled visual features, not forward() class probabilities."""
+        return self.feature_layers(x).flatten(1)
+
+    def forward_with_features(self, x):
+        features = self.forward_features(x)
+        return self.classify_layer(features), features
+
 
 class LTHNet(nn.Module):
     def __init__(self, origin_model, feature_dim=2000, code_length=64, num_classes=100, num_prototypes=100):

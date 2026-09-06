@@ -36,6 +36,22 @@ def current_git_commit():
         return "unknown"
 
 
+def source_sha256():
+    """Identify local code even before the user commits the new branch."""
+    from pathlib import Path
+    root = Path(__file__).resolve().parent.parent
+    digest = hashlib.sha256()
+    for relative in (
+        "run.py", "network.py", "GenerateSimilarityMatrix.py",
+        "GenerateSemanticHashCenters.py", "train.py", "data/data_loader.py",
+        "utils/experiment.py", "utils/tools.py", "utils/reliable_relation.py",
+    ):
+        digest.update(relative.encode())
+        # A checkout on Linux/Windows should have the same source identity.
+        digest.update((root / relative).read_text(encoding="utf-8").encode())
+    return digest.hexdigest()
+
+
 def build_cache_metadata(args, stage):
     metadata = {
         "stage": stage,
@@ -54,6 +70,13 @@ def build_cache_metadata(args, stage):
                 "crop_size": args.crop_size,
             }
         )
+    if stage in {"classifier", "similarity"} and getattr(args, "paired_stage_seeds", False):
+        metadata["classifier_protocol"] = {
+            "batch_size": args.batch_size,
+            "num_workers": args.num_workers,
+            "validation_interval": args.test_map,
+            "deterministic": not args.non_deterministic,
+        }
     if stage in {"similarity", "centers"}:
         metadata["mask_strategy"] = args.mask_strategy
     if stage == "centers":
@@ -63,6 +86,13 @@ def build_cache_metadata(args, stage):
         )
     if stage in {"mds", "centers"}:
         metadata["code_length"] = args.code_length
+    if stage in {"similarity", "centers"} and getattr(args, "variant", "b0") == "b1":
+        from utils.reliable_relation import relation_config
+        metadata["relation"] = relation_config(args)
+        if stage == "similarity":
+            metadata["classifier_sha256"] = args.classifier_sha256
+        else:
+            metadata["similarity_sha256"] = args.similarity_content_sha256
     metadata["config_hash"] = stable_config_hash(metadata)
     return metadata
 
