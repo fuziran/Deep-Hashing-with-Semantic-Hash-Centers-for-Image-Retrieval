@@ -81,12 +81,14 @@ def build_cache_metadata(args, stage):
     if stage in {"similarity", "centers"}:
         metadata["mask_strategy"] = args.mask_strategy
     method = getattr(args, "method", "B0")
-    if stage == "similarity" and method != "B0":
+    if stage == "similarity" and method in {"A1", "A2", "A3", "B1"}:
         metadata.update(
             {
                 "method": method,
                 "classifier_sha256": getattr(args, "classifier_sha256", "unknown"),
                 "rsm_views": args.rsm_views,
+                "relation_batch_size": args.relation_batch_size,
+                "relation_num_workers": args.relation_num_workers,
                 "rsm_temperature_grid": list(args.rsm_temperature_grid),
                 "rsm_confusion_alpha": args.rsm_confusion_alpha,
                 "rsm_view_transform": "deterministic_resize_crop_flip_v1",

@@ -237,7 +237,7 @@ def load_data(args):
         )
 
     train_dataset = make_dataset(train_idx, train_transform)
-    if getattr(args, "method", "B0") == "B0":
+    if getattr(args, "method", "B0") in {"B0", "C1"}:
         relation_dataset = make_dataset(train_idx, eval_transform)
     else:
         multiview_transform = DeterministicWeakMultiViewTransform(
@@ -270,7 +270,19 @@ def load_data(args):
     train_loader = DataLoader(
         train_dataset, shuffle=True, generator=generator, **common_loader_args
     )
-    relation_loader = DataLoader(relation_dataset, shuffle=False, **common_loader_args)
+    relation_loader_args = dict(common_loader_args)
+    relation_loader_args["batch_size"] = getattr(
+        args, "relation_batch_size", args.batch_size
+    )
+    relation_loader_args["num_workers"] = getattr(
+        args, "relation_num_workers", args.num_workers
+    )
+    relation_loader_args["pin_memory"] = (
+        args.device.type == "cuda" and relation_loader_args["num_workers"] > 0
+    )
+    relation_loader = DataLoader(
+        relation_dataset, shuffle=False, **relation_loader_args
+    )
     val_loader = DataLoader(val_dataset, shuffle=False, **common_loader_args)
     query_loader = DataLoader(query_dataset, shuffle=False, **common_loader_args)
     database_loader = DataLoader(database_dataset, shuffle=False, **common_loader_args)

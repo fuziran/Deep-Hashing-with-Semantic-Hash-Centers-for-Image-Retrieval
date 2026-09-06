@@ -143,6 +143,8 @@ class TestClassifierReuse(unittest.TestCase):
         first.mask_strategy = "predicted_argmax"
         first.classifier_sha256 = "classifier"
         first.rsm_views = 4
+        first.relation_batch_size = 16
+        first.relation_num_workers = 0
         first.rsm_temperature_grid = [0.7, 1.0, 1.5, 2.0]
         first.rsm_confusion_alpha = 0.7
         second = argparse.Namespace(**vars(first))
@@ -151,6 +153,13 @@ class TestClassifierReuse(unittest.TestCase):
         second_metadata = build_cache_metadata(second, "similarity")
         self.assertNotEqual(
             first_metadata["config_hash"], second_metadata["config_hash"]
+        )
+
+        third = argparse.Namespace(**vars(first))
+        third.relation_batch_size = 32
+        third_metadata = build_cache_metadata(third, "similarity")
+        self.assertNotEqual(
+            first_metadata["config_hash"], third_metadata["config_hash"]
         )
 
 

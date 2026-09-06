@@ -14,6 +14,7 @@ import torch.optim.lr_scheduler as lr_scheduler
 from scipy.linalg import hadamard
 
 from utils.experiment import state_dict_sha256
+from losses import center_competition
 from utils.tools import CalcTopMapPerQuery, CalcTopMapWithPR, compute_result
 
 torch.multiprocessing.set_sharing_strategy("file_system")
@@ -34,7 +35,19 @@ class CSQLoss(torch.nn.Module):
             0.5 * (continuous_code + 1), 0.5 * (target_center + 1)
         )
         quantization_loss = (continuous_code.abs() - 1).pow(2).mean()
-        return center_loss + args.lambd * quantization_loss
+        loss = center_loss + args.lambd * quantization_loss
+        competition = output.new_zeros(())
+        if getattr(args, "method", "B0") == "C1" and args.competition_weight > 0:
+            competition = center_competition(
+                continuous_code, self.hash_targets, labels.argmax(dim=1),
+                args.competition_temperature,
+            )
+            loss = loss + args.competition_weight * competition
+        self.last_components = {
+            "center": center_loss.detach(), "quantization": quantization_loss.detach(),
+            "competition": competition.detach(),
+        }
+        return loss
 
     def label2center(self, labels):
         return self.hash_targets[labels.argmax(dim=1)]
@@ -165,6 +178,7 @@ def train_val(
         learning_rates.append(optimizer.param_groups[0]["lr"])
         net.train()
         total_loss = 0.0
+        component_sums = {"center": 0.0, "quantization": 0.0, "competition": 0.0}
         for images, labels, indices in train_loader:
             images = images.to(args.device, non_blocking=True)
             labels = labels.to(args.device, non_blocking=True)
@@ -176,6 +190,8 @@ def train_val(
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
+            for name, value in criterion.last_components.items():
+                component_sums[name] += value.item()
         scheduler.step()
         epoch_loss = total_loss / max(len(train_loader), 1)
         losses.append(epoch_loss)
@@ -186,6 +202,8 @@ def train_val(
             "loss": epoch_loss,
             "lr": learning_rates[-1],
             "seconds": time.time() - started,
+            "loss_components": {name: value / max(len(train_loader), 1)
+                                for name, value in component_sums.items()},
         }
         if should_validate:
             validation_metrics, _, _, _, _, _ = _evaluate(
@@ -225,6 +243,9 @@ def train_val(
         "best_model_sha256": state_dict_sha256(best_state),
         "query_metrics": None,
         "query_evaluation_count": 0,
+        "centers_sha256": getattr(args, "centers_sha256", None),
+        "competition_weight": getattr(args, "competition_weight", 0.0),
+        "competition_temperature": getattr(args, "competition_temperature", None),
     }
 
     os.makedirs(args.run_dir, exist_ok=True)

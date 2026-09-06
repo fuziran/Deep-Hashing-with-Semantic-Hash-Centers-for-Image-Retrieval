@@ -96,6 +96,7 @@ python3 run.py --method B1 --dataset cifar-100-new-seg \
   --root ./data/cifar-100-python --num-classes 100 \
   --code-length 32 --seed 60 --classify-epoch 300 --epoch 300 \
   --classifier-cache ./save/ClassificationNet/AUDITED_B0_CLASSIFIER.pt \
+  --relation-batch-size 16 --relation-num-workers 0 \
   --rsm-views 4 --rsm-temperature-grid 0.7 1.0 1.5 2.0 \
   --rsm-confusion-alpha 0.7 --topK -1 100 1000
 ```
@@ -198,3 +199,6 @@ For questions and further information about this research, please don't hesitate
 | Yong Chen | alphawolf.chen@gmail.com |
 
 We welcome collaboration opportunities and are happy to provide additional details about our work.
+# C1 development
+
+The `codex/c1-center-competition` branch adds `--method C1` with fixed audited B0 similarity and center caches. See [C1实验说明.md](C1实验说明.md) for smoke, formal training, paired-control and query-isolation instructions. C1 defaults to competition weight 0.1 and temperature 0.1. Runtime validation is pending; local syntax checks pass.

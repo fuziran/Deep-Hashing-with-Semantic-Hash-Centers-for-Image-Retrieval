@@ -249,6 +249,8 @@ def load_explicit_similarity_cache(args, path):
     metadata = payload["metadata"]
     if not isinstance(metadata, dict):
         raise RuntimeError(f"Invalid similarity cache metadata: {path}")
+    if getattr(args, "method", "B0") == "C1" and metadata.get("method", "B0") != "B0":
+        raise RuntimeError("C1 requires a B0 similarity cache, not an RSM cache")
     stored_without_hash = dict(metadata)
     stored_hash = stored_without_hash.pop("config_hash", None)
     if stored_hash != stable_config_hash(stored_without_hash):

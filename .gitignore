@@ -7,3 +7,5 @@ data/NABirds-B/
 save/
 *.whl
 *.log
+.venv-c1/
+.cache-c1/

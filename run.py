@@ -1,4 +1,5 @@
 import argparse
+import math
 import os
 
 # Must be set before the first CUDA BLAS workspace is created.
@@ -10,6 +11,7 @@ from GenerateSemanticHashCenters import GenerateSemanticHashCenters
 from GenerateSimilarityMatrix import GenerateSimilarityMatrix
 from data.data_loader import load_data
 from network import ResNet
+from utils.center_cache import load_explicit_centers
 from train import evaluate_query_checkpoint, train_val
 from utils.experiment import (
     current_git_commit,
@@ -24,7 +26,7 @@ def load_config():
     parser.add_argument("--seed", default=60, type=int)
     parser.add_argument("--info", default=None, type=str)
     parser.add_argument(
-        "--method", choices=("B0", "A1", "A2", "A3", "B1"), default="B0"
+        "--method", choices=("B0", "A1", "A2", "A3", "B1", "C1"), default="B0"
     )
     parser.add_argument("--dataset", default="cifar-100-new-seg", type=str)
     parser.add_argument("--num-classes", default=100, type=int)
@@ -36,9 +38,24 @@ def load_config():
     parser.add_argument("--test-map", "--test_map", default=5, type=int)
     parser.add_argument("--beta", default=1.0, type=float)
     parser.add_argument("--lambd", default=1e-4, type=float)
+    parser.add_argument("--competition-weight", default=0.1, type=float)
+    parser.add_argument("--competition-temperature", default=0.1, type=float)
+    parser.add_argument("--centers-cache", default=None, type=str)
     parser.add_argument("--topK", nargs="+", default=[-1, 100, 1000], type=int)
     parser.add_argument("--batch-size", default=64, type=int)
     parser.add_argument("--num-workers", default=6, type=int)
+    parser.add_argument(
+        "--relation-batch-size",
+        default=16,
+        type=int,
+        help="RSM-only batch size; does not change Stage 3 training batch size.",
+    )
+    parser.add_argument(
+        "--relation-num-workers",
+        default=0,
+        type=int,
+        help="RSM-only DataLoader workers; zero minimizes host-memory prefetch.",
+    )
     parser.add_argument("--resize-size", default=256, type=int)
     parser.add_argument("--crop-size", default=224, type=int)
     parser.add_argument("--gpu", default=0, type=int)
@@ -103,14 +120,29 @@ def load_config():
 
     if args.force_recompute and args.similarity_cache:
         parser.error("--force-recompute and --similarity-cache cannot be used together")
-    if args.method != "B0" and args.stage != "evaluate" and not args.classifier_cache:
+    if args.method in {"A1", "A2", "A3", "B1"} and args.stage != "evaluate" and not args.classifier_cache:
         parser.error("A1/A2/A3/B1 require the audited B0 --classifier-cache")
+    if not math.isfinite(args.competition_weight) or args.competition_weight < 0:
+        parser.error("--competition-weight must be finite and nonnegative")
+    if not math.isfinite(args.competition_temperature) or args.competition_temperature <= 0:
+        parser.error("--competition-temperature must be finite and positive")
+    if args.method == "C1" and args.stage != "evaluate":
+        if args.stage not in {"train", "all"} or not args.similarity_cache or not args.centers_cache:
+            parser.error("C1 training requires --similarity-cache and --centers-cache from B0")
+        if args.force_recompute or args.evaluate_query:
+            parser.error("C1 development forbids recomputation and automatic query evaluation")
+    if args.centers_cache and args.method not in {"B0", "C1"}:
+        parser.error("--centers-cache is only supported for B0/C1")
     if args.stage == "evaluate" and not args.checkpoint:
         parser.error("--stage evaluate requires --checkpoint")
     if args.stage != "evaluate" and args.checkpoint:
         parser.error("--checkpoint is only valid with --stage evaluate")
     if args.rsm_views < 1:
         parser.error("--rsm-views must be at least one")
+    if args.relation_batch_size < 1:
+        parser.error("--relation-batch-size must be at least one")
+    if args.relation_num_workers < 0:
+        parser.error("--relation-num-workers cannot be negative")
     if not 0.0 <= args.rsm_confusion_alpha <= 1.0:
         parser.error("--rsm-confusion-alpha must be in [0, 1]")
     if any(value <= 0 for value in args.rsm_temperature_grid):
@@ -175,10 +207,22 @@ def main():
         "hash_epochs": args.epoch,
         "learning_rate": args.lr,
         "validation_per_class": args.val_per_class,
+        "batch_size": args.batch_size,
+        "num_workers": args.num_workers,
+        "relation_batch_size": args.relation_batch_size,
+        "relation_num_workers": args.relation_num_workers,
         "rsm_views": args.rsm_views,
         "rsm_temperature_grid": args.rsm_temperature_grid,
         "rsm_confusion_alpha": args.rsm_confusion_alpha,
         "git_commit": args.git_commit,
+        "quantization_weight": args.lambd,
+        "competition_weight": args.competition_weight if args.method == "C1" else 0.0,
+        "competition_temperature": args.competition_temperature if args.method == "C1" else None,
+        "centers_cache": args.centers_cache,
+        "resize_size": args.resize_size,
+        "crop_size": args.crop_size,
+        "test_map": args.test_map,
+        "topK": args.topK,
     }
     args.run_id = stable_config_hash(run_config)
     args.run_dir = os.path.join(
@@ -197,7 +241,9 @@ def main():
 
     # Stage-local reset prevents classifier loading/inference from changing center RNG.
     seed_everything(args.seed, deterministic=not args.non_deterministic)
-    centers = GenerateSemanticHashCenters(args, similarity.to(args.device))
+    centers = (load_explicit_centers(args, args.centers_cache) if args.centers_cache
+               else GenerateSemanticHashCenters(args, similarity.to(args.device)))
+    write_run_manifest(args)
     if args.stage == "centers":
         return
 
