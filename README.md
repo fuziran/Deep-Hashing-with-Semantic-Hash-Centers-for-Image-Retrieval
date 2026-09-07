@@ -221,3 +221,65 @@ nohup python -u run.py \
 训练历史新增 `loss_center_uniform` 和 `i2r_rho`；`loss_center` 是实际用于训练的加权 BCE（关闭权重时为原 BCE），`loss_comp` 和 `comp_weight` 均为0。原 `--comp-*` 默认字段可能仍出现在配置中，但 B2R 不启用竞争模块。
 
 先检查前20轮与配对 B1 的损失和验证是否对齐，再检查 A/v/w 是否有实际选择性。按验证 mAP@ALL 选模，与报告中的 B1=0.55422 比较，并同时报告另外两项验证指标。首轮继续跳过 query；冻结方案后再进行最终 query 评价，不根据 query 调参。未完成真实训练前，不声称 I2-R 有效或已经形成递进提升。
+
+## B2-M：语义关系与中心距离约束的混合正则
+
+新增 `--variant b2m`，组成是冻结 B1 加混合图辅助监督。
+`--mix-mode semantic` 为 I2-M；`--mix-mode plain` 为普通中心 Mixup 对照。
+尚未运行真实训练或评价，代码实现不代表指标提升。
+
+- 原图仍用 B1 的 BCE 和 1e-4 量化项；混合图只用 `BCEWithLogits(2*z, soft_target)`。
+- semantic：先按类别均匀/批内语义 top5 各一半选异类，再在该类均匀选伙伴；同分按类别 ID 排序。
+- plain：在批内全部异类样本中均匀选伙伴，不使用语义偏好或距离上限。
+- 两组均采样伙伴占比 beta0~Uniform[0,0.5)。semantic 取 beta=min(beta0, budget/d_H)，默认 budget=码长/16，32 bit 时为2；plain 使用 beta0。
+- 混合图和软中心使用同一个 beta。异类中心重复会报错；批次没有异类时跳过混合分支。
+- 默认辅助权重：前20轮为0，第21–40轮升至0.1，此后固定。为0时不采样、不额外前向。
+- 原图反传后再混合图反传，最后只调用一次 optimizer.step。混合分支仅冻结 BN 的运行统计，保留仿射参数梯度。
+- 冻结关系及中心沿用父 B1 的配置、内容摘要、缓存元数据校验。哈希网络从配对初始化独立训练，不读取父 B1 最佳网络权重。
+- semantic/plain 使用同一辅助权重日程、BN规则和额外前向次数。约1.93倍图像处理量，实际耗时以日志为准；推理不变。
+
+### 远程开发实验命令（仅供执行，本次未运行）
+
+以下路径对应报告记录的远程 `/mnt/d/fzr/SHC` 项目，请先确认三个冻结产物存在，并把本分支修改文件同步到远程。
+父 B1 训练预算为300轮，因此入口拒绝通过修改 epoch 为1来绕过父级一致性检查。
+测试请使用下方合成单元测试，不需要真实数据或预训练权重。
+
+```bash
+python -m unittest discover -s tests -p 'test_b2m_semantic_mixup.py' -v
+
+mkdir -p logs
+run_stamp=$(date +%Y%m%d_%H%M%S)
+nohup python -u run.py \
+  --variant b2m --mix-mode semantic --paired-stage-seeds \
+  --dataset cifar-100-new-seg --root ./data/cifar-100-python \
+  --num-classes 100 --code-length 32 --seed 60 \
+  --classify-epoch 300 --epoch 300 --test-map 5 \
+  --lr 7e-5 --batch-size 64 --num-workers 4 --gpu 0 \
+  --topK -1 100 1000 \
+  --relation-mode full --relation-kappa 30 \
+  --relation-temperature 1 --relation-weight-floor 0.05 \
+  --parent-b1-config ./save_i1/runs/cifar-100-new-seg_B1_32bit_seed60_a13a73393ff8/config.json \
+  --similarity-cache ./save_i1/SimilarityMatrix/cifar-100-new-seg_82618139bb9c.pt \
+  --center-cache ./save_i1/HashCenters/cifar-100-new-seg_SHC_9b87e583acee.pt \
+  --mix-weight 0.1 --mix-budget 2 --mix-warmup 20 --mix-ramp-end 40 \
+  --skip-query --output-dir "./save_b2m_${run_stamp}" \
+  > "logs/b2m_32bit_seed60_${run_stamp}.log" 2>&1 &
+```
+
+普通对照使用完全相同的参数，将 `--mix-mode semantic` 改为 `--mix-mode plain`，并使用新的输出目录和日志名。
+plain 模式忽略距离预算；预算仍保存在配置中以便审计。不同 mode/weight 等配置进入运行标识，已有运行目录不会覆盖。
+此处没有自动启动第二个权重配置或批量实验的脚本。
+
+### 产物和判断
+
+- `config.json`：完整参数、mix版本、独立采样种子、BN规则、父级来源及源码摘要。
+- `training_history.json`：原图BCE/量化、混合BCE/目标熵/KL、权重、每轮训练耗时和验证指标；B2-M逐轮落盘。分项损失按批次平均，无有效混合样本的批次记0；配对分布按有效样本统计。
+- `mix_diagnostics/epoch_NNN.json`：有效配对数、完整类别对计数、beta/中心距离/关系值的均值与分位数、上限触发率。未启用或无有效配对时不伪造分布。
+- 每轮第一个批次有有效混合样本时记录原图梯度范数及加权混合梯度增量范数，名称以 `sampled_` 开头；这是抽样值，不是整轮平均。
+- `mix_sampler_state.pt`：最近一轮结束的独立采样器状态，模块支持 `load_state_dict`。它不是完整训练断点；当前没有新增恢复训练命令，恢复整个训练还需网络、优化器、调度器及其他随机状态。
+- `best_model_state.pt` / `metrics.json`：仍按验证 mAP@ALL 选同一个模型；传入 `--skip-query` 时不做最终查询评价。
+
+首轮开发门槛：同一选中模型的验证 ALL > 0.5542233697802248，@100 >= 0.65456859，@1000 >= 0.63411706（后两值为报告保存精度）。
+前20轮与配对B1对照属于远程运行后核验项，本地合成测试不能替代该验证。
+混合BCE即使完美拟合也有目标熵下限，应结合KL而非仅看总损失；总损失不能直接与B1比较。
+开发阶段使用 `--skip-query`，冻结配置后才评价query，不将单种子结果描述为稳定递进提升。

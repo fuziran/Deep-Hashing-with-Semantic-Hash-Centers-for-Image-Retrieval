@@ -16,6 +16,7 @@ from scipy.linalg import hadamard
 from utils.tools import CalcTopMapPerQuery, CalcTopMapWithPR, compute_result
 from utils.competition import CenterCompetition, competition_weight
 from utils.bit_supervision import BitSupervision, risk_schedule
+from utils.semantic_mixup import SemanticMixup, mix_weight, backward_mix
 
 torch.multiprocessing.set_sharing_strategy("file_system")
 
@@ -193,6 +194,12 @@ def train_val(
     if hash_center.shape != (args.num_classes, bit):
         hash_center = hash_center.T
     criterion = CSQLoss(args, bit, hash_center, similarity)
+    mixer = None
+    if getattr(args, "variant", "b0") == "b2m":
+        if similarity is None:
+            raise ValueError("B2M requires the frozen B1 relation matrix")
+        mixer = SemanticMixup(hash_center, similarity, args.mix_seed,
+                              args.mix_mode, args.mix_budget)
 
     best_validation_map = float("-inf")
     best_epoch = 0
@@ -206,7 +213,10 @@ def train_val(
         total_loss = 0.0
         component_totals = {}
         criterion.epoch = epoch + 1
-        for images, labels, indices in train_loader:
+        if mixer is not None:
+            mixer.reset_diagnostics()
+        gradient_sample = {}
+        for batch_index, (images, labels, indices) in enumerate(train_loader):
             images = images.to(args.device, non_blocking=True)
             labels = labels.to(args.device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
@@ -215,8 +225,19 @@ def train_val(
             if not torch.isfinite(loss):
                 raise FloatingPointError(f"Non-finite hash loss at epoch {epoch + 1}")
             loss.backward()
+            auxiliary_loss = 0.0
+            if mixer is not None:
+                weight = mix_weight(epoch + 1, args.mix_weight,
+                                    args.mix_warmup, args.mix_ramp_end)
+                mixed_components = backward_mix(net, images, labels.argmax(dim=1),
+                                                mixer, weight, batch_index == 0)
+                gradient_sample = {key: value for key, value in mixed_components.items()
+                                   if key.startswith("sampled_")} or gradient_sample
+                criterion.components.update({key: value for key, value in mixed_components.items()
+                                             if not key.startswith("sampled_")})
+                auxiliary_loss = weight * mixed_components["loss_mix"]
             optimizer.step()
-            total_loss += loss.item()
+            total_loss += loss.item() + auxiliary_loss
             for key, value in criterion.components.items():
                 component_totals[key] = component_totals.get(key, 0.0) + value
         criterion.finish_epoch(args)
@@ -233,7 +254,19 @@ def train_val(
         }
         record.update({key: value / max(len(train_loader), 1)
                        for key, value in component_totals.items()})
-        if criterion.competition is not None or criterion.bit_supervision is not None:
+        if mixer is not None:
+            record.update(gradient_sample)
+            diagnostics_dir = os.path.join(args.run_dir, "mix_diagnostics")
+            os.makedirs(diagnostics_dir, exist_ok=True)
+            diagnostics_path = os.path.join(diagnostics_dir, f"epoch_{epoch + 1:03d}.json")
+            with open(diagnostics_path, "w", encoding="utf-8") as f:
+                json.dump(mixer.diagnostics(), f, indent=2)
+            record["mix_diagnostics"] = os.path.relpath(diagnostics_path, args.run_dir)
+            # A sampler state is not a full optimizer/model resume checkpoint.
+            torch.save({"epoch": epoch + 1, "sampler": mixer.state_dict()},
+                       os.path.join(args.run_dir, "mix_sampler_state.pt"))
+        if (criterion.competition is not None or criterion.bit_supervision is not None
+                or mixer is not None):
             print(f"{args.info} epoch={epoch + 1} components="
                   + json.dumps({key: record[key] for key in component_totals}))
         if should_validate:
@@ -256,6 +289,9 @@ def train_val(
         else:
             print(f"{args.info} epoch={epoch + 1} loss={epoch_loss:.5f}")
         history.append(record)
+        if mixer is not None:
+            with open(os.path.join(args.run_dir, "training_history.json"), "w", encoding="utf-8") as f:
+                json.dump(history, f, ensure_ascii=False, indent=2)
 
     # Save selection before any optional final-query evaluation.
     os.makedirs(args.run_dir, exist_ok=True)

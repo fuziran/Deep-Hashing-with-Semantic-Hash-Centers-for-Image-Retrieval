@@ -40,7 +40,7 @@ def load_frozen_b1(args):
 
     artifact, relation_meta = read_cache(args.similarity_cache)
     if not isinstance(artifact, dict):
-        raise ValueError("B2/B2R requires an I1 relation artifact")
+        raise ValueError("B2/B2R/B2M requires an I1 relation artifact")
     similarity = artifact["similarity"]
     validate_similarity(similarity, args.num_classes)
     digest = tensor_sha256(similarity)

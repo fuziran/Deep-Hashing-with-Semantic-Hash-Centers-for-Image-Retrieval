@@ -24,7 +24,7 @@ from utils.experiment import (
 def load_config():
     parser = argparse.ArgumentParser(description="Faithful and auditable SHC B0 baseline")
     parser.add_argument("--seed", default=60, type=int)
-    parser.add_argument("--variant", choices=("b0", "b1", "b2", "b2r"), default="b0")
+    parser.add_argument("--variant", choices=("b0", "b1", "b2", "b2r", "b2m"), default="b0")
     parser.add_argument("--relation-mode",
                         choices=("full", "two_view", "weighted", "fixed_fusion", "feature_only"),
                         default="full")
@@ -95,7 +95,28 @@ def load_config():
     parser.add_argument("--i2r-stats-start", type=int, default=16)
     parser.add_argument("--i2r-warmup", type=int, default=20)
     parser.add_argument("--i2r-ramp-end", type=int, default=40)
+    parser.add_argument("--mix-mode", choices=("semantic", "plain"), default="semantic")
+    parser.add_argument("--mix-weight", type=float, default=0.1)
+    parser.add_argument("--mix-budget", type=float, default=None,
+                        help="Soft-target Hamming budget; default code-length/16.")
+    parser.add_argument("--mix-warmup", type=int, default=20)
+    parser.add_argument("--mix-ramp-end", type=int, default=40)
     args = parser.parse_args()
+    if args.variant == "b2m":
+        from utils.semantic_mixup import VERSION, mix_weight
+        if args.mix_budget is None:
+            args.mix_budget = args.code_length / 16
+        try:
+            mix_weight(1, args.mix_weight, args.mix_warmup, args.mix_ramp_end)
+            if not math.isfinite(args.mix_budget) or args.mix_budget <= 0:
+                raise ValueError("Mixup budget must be finite and positive")
+            if args.epoch < args.mix_ramp_end:
+                raise ValueError("B2M epoch budget must cover the complete weight ramp")
+        except ValueError as error:
+            parser.error(str(error))
+        args.mix_version = VERSION
+        args.mix_seed = args.seed + 200003
+        args.mix_bn_policy = "clean_running_stats"
     if args.variant == "b2r":
         from utils.bit_supervision import VERSION, risk_schedule
         try:
@@ -106,15 +127,15 @@ def load_config():
         except ValueError as error:
             parser.error(str(error))
         args.i2r_version = VERSION
-    if args.variant in ("b2", "b2r"):
+    if args.variant in ("b2", "b2r", "b2m"):
         if not all((args.parent_b1_config, args.similarity_cache, args.center_cache)):
-            parser.error("B2/B2R requires --parent-b1-config, --similarity-cache and --center-cache")
+            parser.error("B2/B2R/B2M requires --parent-b1-config, --similarity-cache and --center-cache")
         if not args.paired_stage_seeds or args.force_recompute:
-            parser.error("B2/B2R requires --paired-stage-seeds and forbids --force-recompute")
+            parser.error("B2/B2R/B2M requires --paired-stage-seeds and forbids --force-recompute")
         if args.stage not in ("all", "train"):
-            parser.error("B2/B2R supports only --stage all/train with frozen B1 artifacts")
+            parser.error("B2/B2R/B2M supports only --stage all/train with frozen B1 artifacts")
     elif args.parent_b1_config or args.center_cache:
-        parser.error("Parent B1 and center cache options require --variant b2/b2r")
+        parser.error("Parent B1 and center cache options require --variant b2/b2r/b2m")
     from utils.competition import competition_weight
     try:
         competition_weight(1, args.comp_weight, args.comp_warmup, args.comp_ramp_end)
@@ -135,7 +156,7 @@ def load_config():
         args.relation_mode != "full" or args.relation_kappa != 30.0
         or args.relation_temperature != 1.0 or args.relation_weight_floor != 0.05
     ):
-        parser.error("Relation options require --variant b1/b2/b2r")
+        parser.error("Relation options require --variant b1/b2/b2r/b2m")
     if args.info == "[SHC-B0]":
         args.info = f"[SHC-{args.variant.upper()}]"
 
@@ -188,13 +209,13 @@ def main():
         "validation_per_class": args.val_per_class,
         "git_commit": args.git_commit,
     }
-    if args.variant in ("b1", "b2", "b2r"):
+    if args.variant in ("b1", "b2", "b2r", "b2m"):
         from utils.reliable_relation import relation_config
         run_config["variant"] = args.variant
         run_config["relation"] = relation_config(args)
     if args.paired_stage_seeds:
         run_config["paired_stage_seeds"] = True
-    if args.variant in ("b1", "b2", "b2r") or args.paired_stage_seeds:
+    if args.variant in ("b1", "b2", "b2r", "b2m") or args.paired_stage_seeds:
         run_config.update({
             "source_sha256": args.source_sha256,
             "batch_size": args.batch_size,
@@ -208,12 +229,12 @@ def main():
         })
     if args.skip_query:
         run_config["skip_query"] = True
-    if args.variant in ("b2", "b2r"):
+    if args.variant in ("b2", "b2r", "b2m"):
         from utils.frozen_b1 import load_frozen_b1
         similarity, centers = load_frozen_b1(args)
         run_config.update({key: value for key, value in vars(args).items()
                            if key.startswith("parent_")
-                           or key.startswith("i2r_" if args.variant == "b2r" else "comp_")})
+                           or key.startswith({"b2": "comp_", "b2r": "i2r_", "b2m": "mix_"}[args.variant])})
         run_config.update({
             "center_content_sha256": args.center_content_sha256,
             "similarity_content_sha256": args.similarity_content_sha256,
@@ -224,11 +245,11 @@ def main():
         "runs",
         f"{args.dataset}_{args.variant.upper()}_{args.code_length}bit_seed{args.seed}_{args.run_id}",
     )
-    if args.variant in ("b2", "b2r") and os.path.exists(args.run_dir):
+    if args.variant in ("b2", "b2r", "b2m") and os.path.exists(args.run_dir):
         raise FileExistsError(f"Run already exists; choose a new --output-dir: {args.run_dir}")
     write_run_manifest(args)
 
-    if args.variant not in ("b2", "b2r"):
+    if args.variant not in ("b2", "b2r", "b2m"):
         similarity = GenerateSimilarityMatrix(
             args, train_loader, relation_loader, val_loader
         )
@@ -236,7 +257,7 @@ def main():
     if args.stage == "similarity":
         return
 
-    if args.variant not in ("b2", "b2r"):
+    if args.variant not in ("b2", "b2r", "b2m"):
         centers = GenerateSemanticHashCenters(args, similarity.to(args.device))
     from utils.reliable_relation import tensor_sha256
     args.center_content_sha256 = tensor_sha256(centers)
@@ -255,7 +276,7 @@ def main():
         query_loader,
         database_loader,
         num_database,
-        similarity=similarity if args.variant in ("b2", "b2r") else None,
+        similarity=similarity if args.variant in ("b2", "b2r", "b2m") else None,
     )
 
 
