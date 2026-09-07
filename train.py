@@ -15,6 +15,7 @@ from scipy.linalg import hadamard
 
 from utils.tools import CalcTopMapPerQuery, CalcTopMapWithPR, compute_result
 from utils.competition import CenterCompetition, competition_weight
+from utils.bit_supervision import BitSupervision, risk_schedule
 
 torch.multiprocessing.set_sharing_strategy("file_system")
 
@@ -26,6 +27,7 @@ class CSQLoss(torch.nn.Module):
         self.multi_label_random_center = torch.randint(2, (bit,)).float().to(args.device)
         self.criterion = torch.nn.BCELoss().to(args.device)
         self.competition = None
+        self.bit_supervision = None
         self.epoch = 1
         self.components = {}
         if getattr(args, "variant", "b0") == "b2":
@@ -35,6 +37,13 @@ class CSQLoss(torch.nn.Module):
                 self.hash_targets, similarity, args.comp_temperature, args.comp_m0, args.comp_m1
             )
 
+        if getattr(args, "variant", "b0") == "b2r":
+            if similarity is None:
+                raise ValueError("B2R requires the frozen B1 relation matrix")
+            self.bit_supervision = BitSupervision(
+                self.hash_targets, similarity, args.i2r_stats_start, args.i2r_warmup
+            )
+
     def forward(self, output, labels, indices, args):
         del indices
         continuous_code = output.tanh()
@@ -42,6 +51,21 @@ class CSQLoss(torch.nn.Module):
         center_loss = self.criterion(
             0.5 * (continuous_code + 1), 0.5 * (target_center + 1)
         )
+        uniform_center_loss = center_loss
+        rho = 0.0
+        if self.bit_supervision is not None:
+            targets = labels.argmax(dim=1)
+            self.bit_supervision.observe(continuous_code, targets, self.epoch)
+            rho = risk_schedule(self.epoch, args.i2r_rho, args.i2r_stats_start,
+                                args.i2r_warmup, args.i2r_ramp_end)
+            # Exact B1 reduction while disabled, including rho=0 runs.
+            if rho > 0:
+                per_bit = torch.nn.functional.binary_cross_entropy(
+                    0.5 * (continuous_code + 1), 0.5 * (target_center + 1),
+                    reduction="none",
+                )
+                weights = self.bit_supervision.weights(targets, rho, per_bit)
+                center_loss = (weights * per_bit).mean()
         quantization_loss = (continuous_code.abs() - 1).pow(2).mean()
         loss = center_loss + args.lambd * quantization_loss
         comp_loss = continuous_code.new_zeros(())
@@ -58,7 +82,27 @@ class CSQLoss(torch.nn.Module):
             "loss_comp": comp_loss.detach().item(),
             "comp_weight": weight,
         }
+        if self.bit_supervision is not None:
+            self.components.update({"loss_center_uniform": uniform_center_loss.detach().item(),
+                                    "i2r_rho": rho})
         return loss
+
+    def finish_epoch(self, args):
+        if self.bit_supervision is None or self.epoch != args.i2r_warmup:
+            return
+        self.bit_supervision.freeze()
+        diagnostics = self.bit_supervision.diagnostics(args.i2r_rho)
+        os.makedirs(args.run_dir, exist_ok=True)
+        path = os.path.join(args.run_dir, "i2r_statistics.pt")
+        torch.save(diagnostics, path)
+        with open(os.path.join(args.run_dir, "i2r_diagnostics.json"), "w", encoding="utf-8") as f:
+            json.dump({key: value for key, value in diagnostics.items() if key != "tensors"},
+                      f, indent=2)
+        args.i2r_statistics_path = path
+        args.i2r_statistics_sha256 = diagnostics["content_sha256"]
+        from utils.experiment import write_run_manifest
+        write_run_manifest(args)
+        print(f"{args.info} I2-R statistics frozen: " + json.dumps(diagnostics["summary"]))
 
     def label2center(self, labels):
         return self.hash_targets[labels.argmax(dim=1)]
@@ -175,6 +219,7 @@ def train_val(
             total_loss += loss.item()
             for key, value in criterion.components.items():
                 component_totals[key] = component_totals.get(key, 0.0) + value
+        criterion.finish_epoch(args)
         scheduler.step()
         epoch_loss = total_loss / max(len(train_loader), 1)
         losses.append(epoch_loss)
@@ -188,7 +233,7 @@ def train_val(
         }
         record.update({key: value / max(len(train_loader), 1)
                        for key, value in component_totals.items()})
-        if criterion.competition is not None:
+        if criterion.competition is not None or criterion.bit_supervision is not None:
             print(f"{args.info} epoch={epoch + 1} components="
                   + json.dumps({key: record[key] for key in component_totals}))
         if should_validate:

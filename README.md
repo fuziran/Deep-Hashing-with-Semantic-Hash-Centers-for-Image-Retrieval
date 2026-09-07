@@ -169,3 +169,55 @@ For questions and further information about this research, please don't hesitate
 | Yong Chen | alphawolf.chen@gmail.com |
 
 We welcome collaboration opportunities and are happy to provide additional details about our work.
+
+## I2-R：创新一＋比特级中心监督（B2R）
+
+分支 `update-reliable-relation-bit-supervision` 新增 `--variant b2r`。`b0`、`b1`、原 `b2` 保留；`b2r` 使用固定的 B1 关系矩阵和最终中心，以有界加权 BCE 替换均匀 BCE，保留原量化项，不叠加中心竞争损失。哈希网络从配对初始化独立训练，不加载 B1/B2 最佳网络续训。方案是否提高检索指标仍需正式训练验证。
+
+默认参数：
+
+| 参数 | 默认值 | 含义 |
+| --- | --- | --- |
+| `--i2r-rho` | 0.25 | 最大比特重加权强度，与原 comp-weight 无可比性 |
+| `--i2r-stats-start` | 16 | 开始累计训练前向的连续中心偏离 |
+| `--i2r-warmup` | 20 | 本轮结束后冻结统计；此前保持 B1 损失 |
+| `--i2r-ramp-end` | 40 | 第21至40轮将 rho 从0线性升至最大值 |
+
+几何权重 A 按异类关系权重与中心区分位数量计算；连续偏离 e 按训练样本出现次数累计，不平均批次均值。每类风险 v 为 A×e 经类内最大值归一化，权重 w=(1+rho×v)/mean_bits(1+rho×v)。每类平均权重为1；默认 rho 下权重在[0.8,1.25]内。重复异类中心、缺失类别统计和非有限输入将报错。统计使用 detach 后的 CPU float64，不新增图像前向或随机采样；会增加少量设备同步和统计开销。权重统计不是独立测试误差或校准置信度。
+
+冻结产物与 B2 一样通过 `--parent-b1-config`、`--similarity-cache`、`--center-cache` 显式传入，并要求 `--paired-stage-seeds`。共同配置（包括总轮数）必须匹配 B1；不能仅将 epoch 改为1做短程试跑。正确性检查使用不依赖数据的测试：
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+以下为报告记录的远程项目 `/mnt/d/fzr/SHC` 下首个筛选实验命令。执行前应将本分支代码同步至该机器，并确认三个父级产物路径存在。命令不会由文档自动执行。
+
+```bash
+cd /mnt/d/fzr/SHC
+mkdir -p logs
+stamp=$(date +%Y%m%d_%H%M%S)
+nohup python -u run.py \
+  --variant b2r --paired-stage-seeds --skip-query \
+  --dataset cifar-100-new-seg --root ./data/cifar-100-python \
+  --num-classes 100 --code-length 32 --seed 60 \
+  --classify-epoch 300 --epoch 300 --test-map 5 \
+  --lr 7e-5 --batch-size 64 --num-workers 4 --gpu 0 \
+  --topK -1 100 1000 \
+  --parent-b1-config ./save_i1/runs/cifar-100-new-seg_B1_32bit_seed60_a13a73393ff8/config.json \
+  --similarity-cache ./save_i1/SimilarityMatrix/cifar-100-new-seg_82618139bb9c.pt \
+  --center-cache ./save_i1/HashCenters/cifar-100-new-seg_SHC_9b87e583acee.pt \
+  --i2r-rho 0.25 --i2r-stats-start 16 --i2r-warmup 20 --i2r-ramp-end 40 \
+  --output-dir "./save_b2r_${stamp}" \
+  > "logs/b2r_32bit_seed60_${stamp}.log" 2>&1 &
+```
+
+运行目录标识包含 I2-R 参数、统计版本、源码摘要及父级内容摘要。第20轮结束时新增：
+
+- `i2r_statistics.pt`：A、偏离累计和、每类样本次数、e、v、冻结状态、最大 rho 下的 w，以及内容摘要。
+- `i2r_diagnostics.json`：上述分布的分位数、均值、标准差与内容摘要。
+- `config.json`：补记统计文件路径及内容 SHA256；运行前尚未产生的统计摘要不参与初始目录名。
+
+训练历史新增 `loss_center_uniform` 和 `i2r_rho`；`loss_center` 是实际用于训练的加权 BCE（关闭权重时为原 BCE），`loss_comp` 和 `comp_weight` 均为0。原 `--comp-*` 默认字段可能仍出现在配置中，但 B2R 不启用竞争模块。
+
+先检查前20轮与配对 B1 的损失和验证是否对齐，再检查 A/v/w 是否有实际选择性。按验证 mAP@ALL 选模，与报告中的 B1=0.55422 比较，并同时报告另外两项验证指标。首轮继续跳过 query；冻结方案后再进行最终 query 评价，不根据 query 调参。未完成真实训练前，不声称 I2-R 有效或已经形成递进提升。
