@@ -132,7 +132,7 @@ def write_run_manifest(args):
     manifest["cublas_workspace_config"] = os.environ.get(
         "CUBLAS_WORKSPACE_CONFIG"
     )
-    if torch.cuda.is_available():
+    if torch.device(args.device).type == "cuda" and manifest["cuda_available"]:
         manifest["gpu"] = torch.cuda.get_device_name(args.device)
     with open(os.path.join(args.run_dir, "config.json"), "w", encoding="utf-8") as f:
         json.dump(manifest, f, ensure_ascii=False, indent=2)
