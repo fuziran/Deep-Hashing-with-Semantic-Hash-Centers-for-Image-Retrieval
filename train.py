@@ -14,16 +14,26 @@ import torch.optim.lr_scheduler as lr_scheduler
 from scipy.linalg import hadamard
 
 from utils.tools import CalcTopMapPerQuery, CalcTopMapWithPR, compute_result
+from utils.competition import CenterCompetition, competition_weight
 
 torch.multiprocessing.set_sharing_strategy("file_system")
 
 
 class CSQLoss(torch.nn.Module):
-    def __init__(self, args, bit, hash_center):
+    def __init__(self, args, bit, hash_center, similarity=None):
         super().__init__()
-        self.hash_targets = hash_center.to(args.device)
+        self.register_buffer("hash_targets", hash_center.detach().to(args.device))
         self.multi_label_random_center = torch.randint(2, (bit,)).float().to(args.device)
         self.criterion = torch.nn.BCELoss().to(args.device)
+        self.competition = None
+        self.epoch = 1
+        self.components = {}
+        if getattr(args, "variant", "b0") == "b2":
+            if similarity is None:
+                raise ValueError("B2 requires the frozen B1 relation matrix")
+            self.competition = CenterCompetition(
+                self.hash_targets, similarity, args.comp_temperature, args.comp_m0, args.comp_m1
+            )
 
     def forward(self, output, labels, indices, args):
         del indices
@@ -33,7 +43,22 @@ class CSQLoss(torch.nn.Module):
             0.5 * (continuous_code + 1), 0.5 * (target_center + 1)
         )
         quantization_loss = (continuous_code.abs() - 1).pow(2).mean()
-        return center_loss + args.lambd * quantization_loss
+        loss = center_loss + args.lambd * quantization_loss
+        comp_loss = continuous_code.new_zeros(())
+        weight = 0.0
+        if self.competition is not None:
+            comp_loss = self.competition(continuous_code, labels.argmax(dim=1))
+            weight = competition_weight(
+                self.epoch, args.comp_weight, args.comp_warmup, args.comp_ramp_end
+            )
+            loss = loss + weight * comp_loss
+        self.components = {
+            "loss_center": center_loss.detach().item(),
+            "loss_quant": quantization_loss.detach().item(),
+            "loss_comp": comp_loss.detach().item(),
+            "comp_weight": weight,
+        }
+        return loss
 
     def label2center(self, labels):
         return self.hash_targets[labels.argmax(dim=1)]
@@ -110,8 +135,9 @@ def train_val(
     query_loader,
     database_loader,
     num_database,
+    similarity=None,
 ):
-    print("========== start SHC B0 network training ==========")
+    print(f"========== start {args.info} network training ==========")
     bit = args.code_length
     net = args.net(bit).to(args.device)
     optimizer = optim.RMSprop(net.parameters(), lr=args.lr, weight_decay=1e-5)
@@ -122,7 +148,7 @@ def train_val(
     hash_center = hash_center.float()
     if hash_center.shape != (args.num_classes, bit):
         hash_center = hash_center.T
-    criterion = CSQLoss(args, bit, hash_center)
+    criterion = CSQLoss(args, bit, hash_center, similarity)
 
     best_validation_map = float("-inf")
     best_epoch = 0
@@ -134,6 +160,8 @@ def train_val(
         learning_rates.append(optimizer.param_groups[0]["lr"])
         net.train()
         total_loss = 0.0
+        component_totals = {}
+        criterion.epoch = epoch + 1
         for images, labels, indices in train_loader:
             images = images.to(args.device, non_blocking=True)
             labels = labels.to(args.device, non_blocking=True)
@@ -145,6 +173,8 @@ def train_val(
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
+            for key, value in criterion.components.items():
+                component_totals[key] = component_totals.get(key, 0.0) + value
         scheduler.step()
         epoch_loss = total_loss / max(len(train_loader), 1)
         losses.append(epoch_loss)
@@ -156,6 +186,11 @@ def train_val(
             "lr": learning_rates[-1],
             "seconds": time.time() - started,
         }
+        record.update({key: value / max(len(train_loader), 1)
+                       for key, value in component_totals.items()})
+        if criterion.competition is not None:
+            print(f"{args.info} epoch={epoch + 1} components="
+                  + json.dumps({key: record[key] for key in component_totals}))
         if should_validate:
             validation_metrics, _, _, _, _, _ = _evaluate(
                 val_loader, database_loader, net, args, num_database
@@ -177,6 +212,24 @@ def train_val(
             print(f"{args.info} epoch={epoch + 1} loss={epoch_loss:.5f}")
         history.append(record)
 
+    # Save selection before any optional final-query evaluation.
+    os.makedirs(args.run_dir, exist_ok=True)
+    torch.save(best_state, os.path.join(args.run_dir, "best_model_state.pt"))
+    with open(os.path.join(args.run_dir, "training_history.json"), "w", encoding="utf-8") as f:
+        json.dump(history, f, ensure_ascii=False, indent=2)
+    if getattr(args, "skip_query", False):
+        summary = {
+            "selected_epoch": best_epoch,
+            "selection_metric": "validation mAP@ALL",
+            "best_validation_mAP@ALL": best_validation_map,
+            "query_evaluated": False,
+            "query_metrics": None,
+        }
+        with open(os.path.join(args.run_dir, "metrics.json"), "w", encoding="utf-8") as f:
+            json.dump(summary, f, ensure_ascii=False, indent=2)
+        _save_curves(args.run_dir, losses, learning_rates)
+        print(f"Selected epoch {best_epoch}; final query evaluation skipped")
+        return summary
     net.load_state_dict(best_state)
     net.to(args.device)
     final_metrics, pr_data, query_binary, query_label, database_binary, database_label = (
@@ -194,6 +247,7 @@ def train_val(
         "selection_metric": "validation mAP@ALL",
         "best_validation_mAP@ALL": best_validation_map,
         "query_metrics": final_metrics,
+        "query_evaluated": True,
     }
 
     os.makedirs(args.run_dir, exist_ok=True)
@@ -220,5 +274,5 @@ def train_val(
         f"mAP@100={final_metrics['mAP@100']:.5f}, "
         f"mAP@1000={final_metrics['mAP@1000']:.5f}"
     )
-    print("========== finished SHC B0 network training ==========")
+    print(f"========== finished {args.info} network training ==========")
     return summary

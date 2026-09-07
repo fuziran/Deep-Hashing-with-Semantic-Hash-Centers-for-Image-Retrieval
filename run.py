@@ -24,7 +24,7 @@ from utils.experiment import (
 def load_config():
     parser = argparse.ArgumentParser(description="Faithful and auditable SHC B0 baseline")
     parser.add_argument("--seed", default=60, type=int)
-    parser.add_argument("--variant", choices=("b0", "b1"), default="b0")
+    parser.add_argument("--variant", choices=("b0", "b1", "b2"), default="b0")
     parser.add_argument("--relation-mode",
                         choices=("full", "two_view", "weighted", "fixed_fusion", "feature_only"),
                         default="full")
@@ -82,7 +82,34 @@ def load_config():
         action="store_true",
         help="Disable deterministic algorithms; not recommended for reported B0 runs.",
     )
+    parser.add_argument("--parent-b1-config", default=None)
+    parser.add_argument("--center-cache", default=None)
+    parser.add_argument("--skip-query", action="store_true")
+    parser.add_argument("--comp-weight", type=float, default=0.1)
+    parser.add_argument("--comp-temperature", type=float, default=0.1)
+    parser.add_argument("--comp-m0", type=float, default=0.1)
+    parser.add_argument("--comp-m1", type=float, default=0.4)
+    parser.add_argument("--comp-warmup", type=int, default=20)
+    parser.add_argument("--comp-ramp-end", type=int, default=40)
     args = parser.parse_args()
+    if args.variant == "b2":
+        if not all((args.parent_b1_config, args.similarity_cache, args.center_cache)):
+            parser.error("B2 requires --parent-b1-config, --similarity-cache and --center-cache")
+        if not args.paired_stage_seeds or args.force_recompute:
+            parser.error("B2 requires --paired-stage-seeds and forbids --force-recompute")
+        if args.stage not in ("all", "train"):
+            parser.error("B2 supports only --stage all/train with frozen B1 artifacts")
+    elif args.parent_b1_config or args.center_cache:
+        parser.error("Parent B1 and center cache options require --variant b2")
+    from utils.competition import competition_weight
+    try:
+        competition_weight(1, args.comp_weight, args.comp_warmup, args.comp_ramp_end)
+        if (not all(math.isfinite(x) for x in (args.comp_temperature, args.comp_m0, args.comp_m1))
+                or args.comp_temperature <= 0 or min(args.comp_m0, args.comp_m1) < 0
+                or args.comp_m0 + args.comp_m1 > 1):
+            raise ValueError("Require finite temperature > 0, m0/m1 >= 0 and m0+m1 <= 1")
+    except ValueError as error:
+        parser.error(str(error))
 
     for name in ("relation_kappa", "relation_temperature", "relation_weight_floor"):
         value = getattr(args, name)
@@ -94,7 +121,7 @@ def load_config():
         args.relation_mode != "full" or args.relation_kappa != 30.0
         or args.relation_temperature != 1.0 or args.relation_weight_floor != 0.05
     ):
-        parser.error("Relation options require --variant b1")
+        parser.error("Relation options require --variant b1/b2")
     if args.info == "[SHC-B0]":
         args.info = f"[SHC-{args.variant.upper()}]"
 
@@ -147,13 +174,13 @@ def main():
         "validation_per_class": args.val_per_class,
         "git_commit": args.git_commit,
     }
-    if args.variant == "b1":
+    if args.variant in ("b1", "b2"):
         from utils.reliable_relation import relation_config
         run_config["variant"] = args.variant
         run_config["relation"] = relation_config(args)
     if args.paired_stage_seeds:
         run_config["paired_stage_seeds"] = True
-    if args.variant == "b1" or args.paired_stage_seeds:
+    if args.variant in ("b1", "b2") or args.paired_stage_seeds:
         run_config.update({
             "source_sha256": args.source_sha256,
             "batch_size": args.batch_size,
@@ -165,22 +192,37 @@ def main():
             "lambd": args.lambd,
             "deterministic": not args.non_deterministic,
         })
+    if args.skip_query:
+        run_config["skip_query"] = True
+    if args.variant == "b2":
+        from utils.frozen_b1 import load_frozen_b1
+        similarity, centers = load_frozen_b1(args)
+        run_config.update({key: value for key, value in vars(args).items()
+                           if key.startswith("comp_") or key.startswith("parent_")})
+        run_config.update({
+            "center_content_sha256": args.center_content_sha256,
+            "similarity_content_sha256": args.similarity_content_sha256,
+        })
     args.run_id = stable_config_hash(run_config)
     args.run_dir = os.path.join(
         args.output_dir,
         "runs",
         f"{args.dataset}_{args.variant.upper()}_{args.code_length}bit_seed{args.seed}_{args.run_id}",
     )
+    if args.variant == "b2" and os.path.exists(args.run_dir):
+        raise FileExistsError(f"B2 run already exists; choose a new --output-dir: {args.run_dir}")
     write_run_manifest(args)
 
-    similarity = GenerateSimilarityMatrix(
-        args, train_loader, relation_loader, val_loader
-    )
+    if args.variant != "b2":
+        similarity = GenerateSimilarityMatrix(
+            args, train_loader, relation_loader, val_loader
+        )
     write_run_manifest(args)
     if args.stage == "similarity":
         return
 
-    centers = GenerateSemanticHashCenters(args, similarity.to(args.device))
+    if args.variant != "b2":
+        centers = GenerateSemanticHashCenters(args, similarity.to(args.device))
     from utils.reliable_relation import tensor_sha256
     args.center_content_sha256 = tensor_sha256(centers)
     write_run_manifest(args)
@@ -198,6 +240,7 @@ def main():
         query_loader,
         database_loader,
         num_database,
+        similarity=similarity if args.variant == "b2" else None,
     )
 
 
