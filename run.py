@@ -1,4 +1,5 @@
 import argparse
+import json
 import math
 import os
 
@@ -24,7 +25,7 @@ from utils.experiment import (
 def load_config():
     parser = argparse.ArgumentParser(description="Faithful and auditable SHC B0 baseline")
     parser.add_argument("--seed", default=60, type=int)
-    parser.add_argument("--variant", choices=("b0", "b1", "b2", "b2r", "b2m"), default="b0")
+    parser.add_argument("--variant", choices=("b0", "b1", "b2", "b2r", "b2m", "b2sbr"), default="b0")
     parser.add_argument("--relation-mode",
                         choices=("full", "two_view", "weighted", "fixed_fusion", "feature_only"),
                         default="full")
@@ -101,7 +102,35 @@ def load_config():
                         help="Soft-target Hamming budget; default code-length/16.")
     parser.add_argument("--mix-warmup", type=int, default=20)
     parser.add_argument("--mix-ramp-end", type=int, default=40)
+    parser.add_argument("--rank-mode", choices=("semantic", "uniform"), default="semantic")
+    parser.add_argument("--rank-weight", type=float, default=0.05)
+    parser.add_argument("--rank-capacity", type=int, default=1024)
+    parser.add_argument("--rank-max-age", type=int, default=16)
+    parser.add_argument("--rank-chunk-size", type=int, default=64)
+    parser.add_argument("--rank-warmup", type=int, default=20)
+    parser.add_argument("--rank-ramp-end", type=int, default=40)
+    parser.add_argument("--resume-sbr", default=None,
+                        help="Trusted SBR epoch checkpoint; requires an unused output directory.")
     args = parser.parse_args()
+    if args.resume_sbr and args.variant != "b2sbr":
+        parser.error("--resume-sbr requires --variant b2sbr")
+    if args.variant == "b2sbr":
+        from utils.semantic_rank import VERSION, rank_weight
+        try:
+            rank_weight(1, args.rank_weight, args.rank_warmup, args.rank_ramp_end)
+            if min(args.rank_capacity, args.rank_max_age, args.rank_chunk_size, args.code_length) <= 0:
+                raise ValueError("Ranking capacity/age/chunk/bits must be positive")
+            if args.epoch < args.rank_ramp_end:
+                raise ValueError("SBR epoch budget must cover the complete weight ramp")
+        except ValueError as error:
+            parser.error(str(error))
+        args.rank_version = VERSION
+        args.rank_margin_bits = 1
+        args.rank_topk = 5
+        args.rank_semantic_fraction = 0.5 if args.rank_mode == "semantic" else 0.0
+        args.rank_queue_policy = "post-step-pre-update-codes-no-warmup-queue"
+        args.rank_proxy = "binary-forward-continuous-anchor-gradient"
+
     if args.variant == "b2m":
         from utils.semantic_mixup import VERSION, mix_weight
         if args.mix_budget is None:
@@ -127,15 +156,15 @@ def load_config():
         except ValueError as error:
             parser.error(str(error))
         args.i2r_version = VERSION
-    if args.variant in ("b2", "b2r", "b2m"):
+    if args.variant in ("b2", "b2r", "b2m", "b2sbr"):
         if not all((args.parent_b1_config, args.similarity_cache, args.center_cache)):
-            parser.error("B2/B2R/B2M requires --parent-b1-config, --similarity-cache and --center-cache")
+            parser.error("B2/B2R/B2M/B2SBR requires --parent-b1-config, --similarity-cache and --center-cache")
         if not args.paired_stage_seeds or args.force_recompute:
-            parser.error("B2/B2R/B2M requires --paired-stage-seeds and forbids --force-recompute")
+            parser.error("B2/B2R/B2M/B2SBR requires --paired-stage-seeds and forbids --force-recompute")
         if args.stage not in ("all", "train"):
-            parser.error("B2/B2R/B2M supports only --stage all/train with frozen B1 artifacts")
+            parser.error("B2/B2R/B2M/B2SBR supports only --stage all/train with frozen B1 artifacts")
     elif args.parent_b1_config or args.center_cache:
-        parser.error("Parent B1 and center cache options require --variant b2/b2r/b2m")
+        parser.error("Parent B1 and center cache options require --variant b2/b2r/b2m/b2sbr")
     from utils.competition import competition_weight
     try:
         competition_weight(1, args.comp_weight, args.comp_warmup, args.comp_ramp_end)
@@ -156,7 +185,7 @@ def load_config():
         args.relation_mode != "full" or args.relation_kappa != 30.0
         or args.relation_temperature != 1.0 or args.relation_weight_floor != 0.05
     ):
-        parser.error("Relation options require --variant b1/b2/b2r/b2m")
+        parser.error("Relation options require --variant b1/b2/b2r/b2m/b2sbr")
     if args.info == "[SHC-B0]":
         args.info = f"[SHC-{args.variant.upper()}]"
 
@@ -209,13 +238,13 @@ def main():
         "validation_per_class": args.val_per_class,
         "git_commit": args.git_commit,
     }
-    if args.variant in ("b1", "b2", "b2r", "b2m"):
+    if args.variant in ("b1", "b2", "b2r", "b2m", "b2sbr"):
         from utils.reliable_relation import relation_config
         run_config["variant"] = args.variant
         run_config["relation"] = relation_config(args)
     if args.paired_stage_seeds:
         run_config["paired_stage_seeds"] = True
-    if args.variant in ("b1", "b2", "b2r", "b2m") or args.paired_stage_seeds:
+    if args.variant in ("b1", "b2", "b2r", "b2m", "b2sbr") or args.paired_stage_seeds:
         run_config.update({
             "source_sha256": args.source_sha256,
             "batch_size": args.batch_size,
@@ -229,12 +258,12 @@ def main():
         })
     if args.skip_query:
         run_config["skip_query"] = True
-    if args.variant in ("b2", "b2r", "b2m"):
+    if args.variant in ("b2", "b2r", "b2m", "b2sbr"):
         from utils.frozen_b1 import load_frozen_b1
         similarity, centers = load_frozen_b1(args)
         run_config.update({key: value for key, value in vars(args).items()
                            if key.startswith("parent_")
-                           or key.startswith({"b2": "comp_", "b2r": "i2r_", "b2m": "mix_"}[args.variant])})
+                           or key.startswith({"b2": "comp_", "b2r": "i2r_", "b2m": "mix_", "b2sbr": "rank_"}[args.variant])})
         run_config.update({
             "center_content_sha256": args.center_content_sha256,
             "similarity_content_sha256": args.similarity_content_sha256,
@@ -245,11 +274,19 @@ def main():
         "runs",
         f"{args.dataset}_{args.variant.upper()}_{args.code_length}bit_seed{args.seed}_{args.run_id}",
     )
-    if args.variant in ("b2", "b2r", "b2m") and os.path.exists(args.run_dir):
+    if args.variant in ("b2", "b2r", "b2m", "b2sbr") and os.path.exists(args.run_dir):
         raise FileExistsError(f"Run already exists; choose a new --output-dir: {args.run_dir}")
+    if args.variant == "b2sbr":
+        print("SBR configuration=" + json.dumps({
+            key: value for key, value in vars(args).items()
+            if key.startswith("rank_") or key in (
+                "variant", "seed", "code_length", "run_id", "git_commit", "source_sha256",
+                "split_hash", "parent_b1_run_id", "similarity_content_sha256",
+                "center_content_sha256", "skip_query", "resume_sbr")
+        }, sort_keys=True))
     write_run_manifest(args)
 
-    if args.variant not in ("b2", "b2r", "b2m"):
+    if args.variant not in ("b2", "b2r", "b2m", "b2sbr"):
         similarity = GenerateSimilarityMatrix(
             args, train_loader, relation_loader, val_loader
         )
@@ -257,7 +294,7 @@ def main():
     if args.stage == "similarity":
         return
 
-    if args.variant not in ("b2", "b2r", "b2m"):
+    if args.variant not in ("b2", "b2r", "b2m", "b2sbr"):
         centers = GenerateSemanticHashCenters(args, similarity.to(args.device))
     from utils.reliable_relation import tensor_sha256
     args.center_content_sha256 = tensor_sha256(centers)
@@ -276,7 +313,7 @@ def main():
         query_loader,
         database_loader,
         num_database,
-        similarity=similarity if args.variant in ("b2", "b2r", "b2m") else None,
+        similarity=similarity if args.variant in ("b2", "b2r", "b2m", "b2sbr") else None,
     )
 
 

@@ -17,6 +17,8 @@ from utils.tools import CalcTopMapPerQuery, CalcTopMapWithPR, compute_result
 from utils.competition import CenterCompetition, competition_weight
 from utils.bit_supervision import BitSupervision, risk_schedule
 from utils.semantic_mixup import SemanticMixup, mix_weight, backward_mix
+from utils.semantic_rank import SemanticRank, rank_weight, sampled_gradient_diagnostics
+from utils.rank_checkpoint import atomic_save, save_checkpoint, restore_checkpoint
 
 torch.multiprocessing.set_sharing_strategy("file_system")
 
@@ -201,12 +203,30 @@ def train_val(
         mixer = SemanticMixup(hash_center, similarity, args.mix_seed,
                               args.mix_mode, args.mix_budget)
 
+    ranker = None
+    if getattr(args, "variant", "b0") == "b2sbr":
+        if similarity is None:
+            raise ValueError("SBR requires the frozen B1 relation matrix")
+        ranker = SemanticRank(hash_center, similarity, args.rank_capacity,
+                              args.rank_max_age, args.rank_mode, args.rank_chunk_size)
+        os.makedirs(args.run_dir, exist_ok=True)
+
     best_validation_map = float("-inf")
     best_epoch = 0
     best_state = {key: value.detach().cpu().clone() for key, value in net.state_dict().items()}
     history, losses, learning_rates = [], [], []
 
-    for epoch in range(args.epoch):
+    start_epoch, global_step = 0, 0
+    if ranker is not None and getattr(args, "resume_sbr", None):
+        resumed = restore_checkpoint(args.resume_sbr, args, net, optimizer, scheduler, ranker, train_loader)
+        start_epoch, global_step = resumed["epoch"], resumed["global_step"]
+        best_state, best_epoch = resumed["best_state"], resumed["best_epoch"]
+        best_validation_map, history = resumed["best_map"], resumed["history"]
+        losses = [row["loss"] for row in history]
+        learning_rates = [row["lr"] for row in history]
+        atomic_save(best_state, os.path.join(args.run_dir, "best_model_state.pt"))
+
+    for epoch in range(start_epoch, args.epoch):
         started = time.time()
         learning_rates.append(optimizer.param_groups[0]["lr"])
         net.train()
@@ -215,6 +235,8 @@ def train_val(
         criterion.epoch = epoch + 1
         if mixer is not None:
             mixer.reset_diagnostics()
+        if ranker is not None:
+            ranker.reset_diagnostics()
         gradient_sample = {}
         for batch_index, (images, labels, indices) in enumerate(train_loader):
             images = images.to(args.device, non_blocking=True)
@@ -224,8 +246,27 @@ def train_val(
             loss = criterion(output, labels, indices, args)
             if not torch.isfinite(loss):
                 raise FloatingPointError(f"Non-finite hash loss at epoch {epoch + 1}")
-            loss.backward()
             auxiliary_loss = 0.0
+            rank_strength = 0.0
+            if ranker is not None:
+                rank_strength = rank_weight(epoch + 1, args.rank_weight,
+                                            args.rank_warmup, args.rank_ramp_end)
+                if rank_strength > 0:
+                    rank_loss = ranker.loss(output.tanh(), labels.argmax(dim=1), indices, global_step)
+                    if not torch.isfinite(rank_loss):
+                        raise FloatingPointError("Non-finite binary ranking loss")
+                    weighted_rank = rank_strength * rank_loss
+                    if batch_index == 0:
+                        gradient_sample = sampled_gradient_diagnostics(loss, weighted_rank, net.parameters())
+                    (loss + weighted_rank).backward()
+                    auxiliary_loss = weighted_rank.detach().item()
+                    criterion.components["loss_rank"] = rank_loss.detach().item()
+                else:
+                    loss.backward()
+                    criterion.components["loss_rank"] = 0.0
+                criterion.components["rank_weight"] = rank_strength
+            else:
+                loss.backward()
             if mixer is not None:
                 weight = mix_weight(epoch + 1, args.mix_weight,
                                     args.mix_warmup, args.mix_ramp_end)
@@ -237,6 +278,10 @@ def train_val(
                                              if not key.startswith("sampled_")})
                 auxiliary_loss = weight * mixed_components["loss_mix"]
             optimizer.step()
+            if ranker is not None:
+                if rank_strength > 0:
+                    ranker.enqueue(output.detach().tanh(), labels.argmax(dim=1), indices, global_step)
+                global_step += 1
             total_loss += loss.item() + auxiliary_loss
             for key, value in criterion.components.items():
                 component_totals[key] = component_totals.get(key, 0.0) + value
@@ -265,8 +310,16 @@ def train_val(
             # A sampler state is not a full optimizer/model resume checkpoint.
             torch.save({"epoch": epoch + 1, "sampler": mixer.state_dict()},
                        os.path.join(args.run_dir, "mix_sampler_state.pt"))
+        if ranker is not None:
+            record.update(gradient_sample)
+            record["rank_diagnostics"] = ranker.diagnostics()
+            print(f"{args.info} epoch={epoch + 1} rank_diagnostics="
+                  + json.dumps(record["rank_diagnostics"]))
+            if gradient_sample:
+                print(f"{args.info} epoch={epoch + 1} rank_gradient_sample="
+                      + json.dumps(gradient_sample))
         if (criterion.competition is not None or criterion.bit_supervision is not None
-                or mixer is not None):
+                or mixer is not None or ranker is not None):
             print(f"{args.info} epoch={epoch + 1} components="
                   + json.dumps({key: record[key] for key in component_totals}))
         if should_validate:
@@ -280,6 +333,8 @@ def train_val(
                 best_state = {
                     key: value.detach().cpu().clone() for key, value in net.state_dict().items()
                 }
+                if ranker is not None:
+                    atomic_save(best_state, os.path.join(args.run_dir, "best_model_state.pt"))
             print(
                 f"{args.info} epoch={epoch + 1} loss={epoch_loss:.5f} "
                 f"val_ALL={validation_metrics['mAP@ALL']:.5f} "
@@ -289,7 +344,12 @@ def train_val(
         else:
             print(f"{args.info} epoch={epoch + 1} loss={epoch_loss:.5f}")
         history.append(record)
-        if mixer is not None:
+        if ranker is not None:
+            record["seconds_before_checkpoint"] = time.time() - started
+            save_checkpoint(os.path.join(args.run_dir, "last_checkpoint.pt"), args, net,
+                            optimizer, scheduler, ranker, train_loader, epoch + 1, global_step,
+                            best_state, best_epoch, best_validation_map, history)
+        if mixer is not None or ranker is not None:
             with open(os.path.join(args.run_dir, "training_history.json"), "w", encoding="utf-8") as f:
                 json.dump(history, f, ensure_ascii=False, indent=2)
 
