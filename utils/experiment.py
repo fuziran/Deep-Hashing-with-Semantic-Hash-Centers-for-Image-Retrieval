@@ -47,6 +47,7 @@ def source_sha256():
         "utils/experiment.py", "utils/tools.py", "utils/reliable_relation.py",
         "utils/competition.py", "utils/frozen_b1.py", "utils/bit_supervision.py",
         "utils/semantic_mixup.py", "utils/semantic_rank.py", "utils/rank_checkpoint.py",
+        "utils/neighbor_feature_distill.py",
     ):
         digest.update(relative.encode())
         # A checkout on Linux/Windows should have the same source identity.
@@ -88,7 +89,7 @@ def build_cache_metadata(args, stage):
         )
     if stage in {"mds", "centers"}:
         metadata["code_length"] = args.code_length
-    if stage in {"similarity", "centers"} and getattr(args, "variant", "b0") in ("b1", "b2", "b2r", "b2m", "b2sbr"):
+    if stage in {"similarity", "centers"} and getattr(args, "variant", "b0") in ("b1", "b2", "b2r", "b2m", "b2sbr", "b2nfd"):
         from utils.reliable_relation import relation_config
         metadata["relation"] = relation_config(args)
         if stage == "similarity":

@@ -183,9 +183,12 @@ def train_val(
     database_loader,
     num_database,
     similarity=None,
+    nfd=None,
 ):
     print(f"========== start {args.info} network training ==========")
     bit = args.code_length
+    if (getattr(args, "variant", "b0") == "b2nfd") != (nfd is not None):
+        raise ValueError("NFD variant requires exactly one prepared frozen distiller")
     net = args.net(bit).to(args.device)
     optimizer = optim.RMSprop(net.parameters(), lr=args.lr, weight_decay=1e-5)
     scheduler = lr_scheduler.CosineAnnealingLR(
@@ -242,7 +245,15 @@ def train_val(
             images = images.to(args.device, non_blocking=True)
             labels = labels.to(args.device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
-            output = net(images)
+            nfd_strength = 0.0
+            if nfd is not None:
+                from utils.neighbor_feature_distill import nfd_weight
+                nfd_strength = nfd_weight(epoch + 1, args.nfd_weight,
+                                          args.nfd_warmup, args.nfd_ramp_end)
+            if nfd_strength > 0:
+                output, features = net.forward_with_features(images)
+            else:
+                output = net(images)
             loss = criterion(output, labels, indices, args)
             if not torch.isfinite(loss):
                 raise FloatingPointError(f"Non-finite hash loss at epoch {epoch + 1}")
@@ -265,6 +276,22 @@ def train_val(
                     loss.backward()
                     criterion.components["loss_rank"] = 0.0
                 criterion.components["rank_weight"] = rank_strength
+            elif nfd is not None:
+                if nfd_strength > 0:
+                    nfd_loss = nfd(features, images, labels.argmax(dim=1))
+                    if not torch.isfinite(nfd_loss):
+                        raise FloatingPointError("Non-finite NFD loss")
+                    weighted_nfd = nfd_strength * nfd_loss
+                    if batch_index == 0:
+                        sample = sampled_gradient_diagnostics(loss, weighted_nfd, net.parameters())
+                        gradient_sample = {key.replace("rank", "nfd"): value for key, value in sample.items()}
+                    (loss + weighted_nfd).backward()
+                    auxiliary_loss = weighted_nfd.detach().item()
+                    criterion.components.update(nfd.components)
+                else:
+                    loss.backward()
+                    criterion.components["loss_nfd"] = 0.0
+                criterion.components["nfd_weight"] = nfd_strength
             else:
                 loss.backward()
             if mixer is not None:
@@ -318,8 +345,12 @@ def train_val(
             if gradient_sample:
                 print(f"{args.info} epoch={epoch + 1} rank_gradient_sample="
                       + json.dumps(gradient_sample))
+        if nfd is not None:
+            record.update(gradient_sample)
+            if gradient_sample:
+                print(f"{args.info} epoch={epoch + 1} nfd_gradient_sample=" + json.dumps(gradient_sample))
         if (criterion.competition is not None or criterion.bit_supervision is not None
-                or mixer is not None or ranker is not None):
+                or mixer is not None or ranker is not None or nfd is not None):
             print(f"{args.info} epoch={epoch + 1} components="
                   + json.dumps({key: record[key] for key in component_totals}))
         if should_validate:
@@ -333,7 +364,7 @@ def train_val(
                 best_state = {
                     key: value.detach().cpu().clone() for key, value in net.state_dict().items()
                 }
-                if ranker is not None:
+                if ranker is not None or nfd is not None:
                     atomic_save(best_state, os.path.join(args.run_dir, "best_model_state.pt"))
             print(
                 f"{args.info} epoch={epoch + 1} loss={epoch_loss:.5f} "
@@ -349,7 +380,7 @@ def train_val(
             save_checkpoint(os.path.join(args.run_dir, "last_checkpoint.pt"), args, net,
                             optimizer, scheduler, ranker, train_loader, epoch + 1, global_step,
                             best_state, best_epoch, best_validation_map, history)
-        if mixer is not None or ranker is not None:
+        if mixer is not None or ranker is not None or nfd is not None:
             with open(os.path.join(args.run_dir, "training_history.json"), "w", encoding="utf-8") as f:
                 json.dump(history, f, ensure_ascii=False, indent=2)
 

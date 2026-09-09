@@ -88,6 +88,11 @@ class ResNet(nn.Module):
         # x = self.tanh(x)
         return x
 
+    def forward_with_features(self, x):
+        features = self.feature_layers(x).flatten(1)
+        return self.hash_layer(features), features
+
+
 class NewNet(nn.Module):
     def __init__(self, hash_bit, pretrained=True):
         super(NewNet, self).__init__()
