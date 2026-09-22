@@ -45,6 +45,7 @@ def source_sha256():
         "run.py", "network.py", "GenerateSimilarityMatrix.py",
         "GenerateSemanticHashCenters.py", "train.py", "data/data_loader.py",
         "utils/experiment.py", "utils/tools.py", "utils/reliable_relation.py",
+        "utils/foreground_aux.py",
     ):
         digest.update(relative.encode())
         # A checkout on Linux/Windows should have the same source identity.
@@ -61,6 +62,8 @@ def build_cache_metadata(args, stage):
         "num_classes": args.num_classes,
         "git_commit": args.git_commit,
     }
+    if hasattr(args, "data_sha256"):
+        metadata["data_sha256"] = args.data_sha256
     if stage in {"classifier", "similarity"}:
         metadata.update(
             {
@@ -99,7 +102,11 @@ def build_cache_metadata(args, stage):
 
 def save_cache(path, value, metadata):
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    torch.save({"value": value, "metadata": metadata}, path)
+    payload = {"value": value, "metadata": metadata}
+    if metadata.get("stage") == "classifier" and metadata.get("data_sha256"):
+        from utils.reliable_relation import state_sha256
+        payload["state_sha256"] = state_sha256(value)
+    torch.save(payload, path)
 
 
 def load_cache(path, expected_metadata, map_location="cpu"):
@@ -113,6 +120,10 @@ def load_cache(path, expected_metadata, map_location="cpu"):
             f"Cache metadata mismatch: {path}\n"
             f"expected={expected_metadata}\nactual={payload['metadata']}"
         )
+    if expected_metadata.get("stage") == "classifier" and expected_metadata.get("data_sha256"):
+        from utils.reliable_relation import state_sha256
+        if payload.get("state_sha256") != state_sha256(payload["value"]):
+            raise RuntimeError(f"Classifier state SHA256 mismatch: {path}")
     return payload["value"]
 
 

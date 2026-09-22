@@ -40,8 +40,10 @@ resnet_dict = {"ResNet18": models.resnet18, "ResNet34": models.resnet34, "ResNet
                "ResNet101": models.resnet101, "ResNet152": models.resnet152}
 
 
-def _build_resnet(res_model="ResNet34"):
+def _build_resnet(res_model="ResNet34", pretrained=True):
     """Build ImageNet-pretrained ResNet with one consistent local weight path."""
+    if not pretrained:
+        return resnet_dict[res_model](weights=None)
     local_weight_path = "./models_ckpt/resnet34-b627a593.pth"
     if res_model == "ResNet34" and os.path.exists(local_weight_path):
         model_resnet = resnet_dict[res_model](weights=None)
@@ -114,9 +116,9 @@ class NewNet(nn.Module):
         return encode_x, encode_x2
 
 class ClassifyNet(nn.Module):
-    def __init__(self, n_class, res_model="ResNet34"):
+    def __init__(self, n_class, res_model="ResNet34", pretrained=True):
         super(ClassifyNet, self).__init__()
-        model_resnet = _build_resnet(res_model)
+        model_resnet = _build_resnet(res_model, pretrained=pretrained)
 
 
         self.conv1 = model_resnet.conv1

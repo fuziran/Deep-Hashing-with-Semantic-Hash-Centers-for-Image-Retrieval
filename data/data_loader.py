@@ -16,20 +16,11 @@ def _unpickle(file_path):
 
 
 def _resolve_cifar100_root(root):
-    candidates = [
-        root,
-        os.path.join(root, "cifar-100-python"),
-        "./data/cifar-100-python",
-        "./data/cifar/cifar-100-python",
-        "./datasets/CIFAR-100/cifar-100-python",
-        "./datasets/cifar-100-python",
-    ]
+    candidates = [root, os.path.join(root, "cifar-100-python")]
     for candidate in candidates:
-        if candidate and all(
-            os.path.exists(os.path.join(candidate, name))
-            for name in ("train", "test", "meta")
-        ):
-            return candidate
+        if candidate and all(os.path.isfile(os.path.join(candidate, name))
+                             for name in ("train", "test", "meta")):
+            return os.path.abspath(candidate)
     raise FileNotFoundError(
         "Cannot find CIFAR-100 raw files. Put train/test/meta under "
         "./data/cifar-100-python or pass --root explicitly."
@@ -149,7 +140,16 @@ def load_data(args):
             "Cars/NABirds need a separately audited manifest loader."
         )
 
+    args.root = _resolve_cifar100_root(args.root)
+    print(f"Resolved CIFAR-100 root: {args.root}")
     images, labels = _load_cifar100_raw(args.root)
+    digest = hashlib.sha256(np.ascontiguousarray(images).tobytes())
+    digest.update(np.asarray(labels, dtype="<i8").tobytes())
+    args.data_sha256 = digest.hexdigest()
+    args.classifier_cache_sha256 = None
+    if getattr(args, "classifier_cache", None):
+        with open(args.classifier_cache, "rb") as stream:
+            args.classifier_cache_sha256 = hashlib.sha256(stream.read()).hexdigest()
     train_idx, val_idx, query_idx, database_idx = _stratified_split_cifar100(
         labels, seed=args.seed, val_per_class=args.val_per_class
     )
@@ -185,6 +185,13 @@ def load_data(args):
 
     train_dataset = make_dataset(train_idx, train_transform)
     relation_dataset = make_dataset(train_idx, eval_transform)
+    if getattr(args, "aux_manifest", None):
+        from utils.foreground_aux import load_auxiliary
+        relation_dataset.auxiliary = load_auxiliary(
+            args.aux_manifest, args.aux_root, images, labels, train_idx, eval_transform)
+        args.aux_content_sha256 = relation_dataset.auxiliary["sha256"]
+        args.aux_count = len(relation_dataset.auxiliary["records"])
+        print(f"Audited auxiliary images: {args.aux_count}; sha256={args.aux_content_sha256}")
     val_dataset = make_dataset(val_idx, eval_transform)
     query_dataset = make_dataset(query_idx, eval_transform)
     database_dataset = make_dataset(database_idx, eval_transform)

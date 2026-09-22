@@ -31,6 +31,12 @@ def load_config():
     parser.add_argument("--relation-kappa", type=float, default=30.0)
     parser.add_argument("--relation-temperature", type=float, default=1.0)
     parser.add_argument("--relation-weight-floor", type=float, default=0.05)
+    parser.add_argument("--aux-manifest", help="Approved training crop CSV; default disables auxiliary views")
+    parser.add_argument("--aux-root", help="Image root containing manifest-relative auxiliary PNGs")
+    parser.add_argument("--aux-alpha", type=float, default=0.2)
+    parser.add_argument("--classifier-cache", help="Explicit audited classifier cache from this data protocol")
+    parser.add_argument("--relation-diagnostics-only", action="store_true",
+                        help="Require cached classifier; estimate relations only, never train")
     parser.add_argument("--paired-stage-seeds", action="store_true",
                         help="Reset hash-stage RNG and training order identically for B0/B1.")
     parser.add_argument("--info", default="[SHC-B0]", type=str)
@@ -66,7 +72,7 @@ def load_config():
     )
     parser.add_argument(
         "--stage",
-        choices=("all", "similarity", "centers", "train"),
+        choices=("all", "classifier", "similarity", "centers", "train"),
         default="all",
     )
     parser.add_argument("--output-dir", default="./save", type=str)
@@ -95,6 +101,18 @@ def load_config():
         or args.relation_temperature != 1.0 or args.relation_weight_floor != 0.05
     ):
         parser.error("Relation options require --variant b1")
+    if bool(args.aux_manifest) != bool(args.aux_root):
+        parser.error("--aux-manifest and --aux-root must be supplied together")
+    if not math.isfinite(args.aux_alpha) or not 0 <= args.aux_alpha <= 1:
+        parser.error("--aux-alpha must be finite and in [0, 1]")
+    if args.aux_manifest and (args.variant != "b1" or args.relation_mode != "full"):
+        parser.error("Auxiliary views require --variant b1 --relation-mode full")
+    if args.relation_diagnostics_only:
+        if args.variant != "b1" or args.force_recompute or args.similarity_cache:
+            parser.error("Diagnostics require B1, without --force-recompute or --similarity-cache")
+        args.stage = "similarity"
+    if args.classifier_cache and (args.force_recompute or args.similarity_cache):
+        parser.error("--classifier-cache conflicts with --force-recompute/--similarity-cache")
     if args.info == "[SHC-B0]":
         args.info = f"[SHC-{args.variant.upper()}]"
 
@@ -137,10 +155,12 @@ def main():
         "dataset": args.dataset,
         "seed": args.seed,
         "split_sha256": args.split_hash,
+        "data_sha256": args.data_sha256,
         "code_length": args.code_length,
         "mask_strategy": args.mask_strategy,
         "center_update_strategy": args.center_update_strategy,
         "similarity_cache": args.similarity_cache,
+        "classifier_cache_sha256": args.classifier_cache_sha256,
         "classification_epochs": args.classify_epoch,
         "hash_epochs": args.epoch,
         "learning_rate": args.lr,
@@ -172,6 +192,14 @@ def main():
         f"{args.dataset}_{args.variant.upper()}_{args.code_length}bit_seed{args.seed}_{args.run_id}",
     )
     write_run_manifest(args)
+
+    if args.stage == "classifier":
+        from GenerateSimilarityMatrix import TrainClassificationNetwork
+        from utils.reliable_relation import state_sha256
+        net = TrainClassificationNetwork(args, train_loader, val_loader)
+        args.classifier_sha256 = state_sha256(net.state_dict())
+        write_run_manifest(args)
+        return
 
     similarity = GenerateSimilarityMatrix(
         args, train_loader, relation_loader, val_loader

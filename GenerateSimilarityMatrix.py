@@ -54,14 +54,42 @@ def _classifier_cache(args):
 def TrainClassificationNetwork(args, train_loader, val_loader):
     print("========== start classification network ==========")
     cache_path, metadata = _classifier_cache(args)
+    explicit = getattr(args, "classifier_cache", None)
+    if explicit:
+        import hashlib
+        from utils.reliable_relation import state_sha256
+        with open(explicit, "rb") as stream:
+            if hashlib.sha256(stream.read()).hexdigest() != args.classifier_cache_sha256:
+                raise RuntimeError("Explicit classifier file changed after preflight")
+        payload = torch.load(explicit, map_location="cpu")
+        if not isinstance(payload, dict) or "value" not in payload or "metadata" not in payload:
+            raise RuntimeError("Invalid explicit classifier cache")
+        stored = payload["metadata"]
+        unhashed = dict(stored)
+        if unhashed.pop("config_hash", None) != stable_config_hash(unhashed):
+            raise RuntimeError("Invalid classifier metadata hash")
+        if not stored.get("data_sha256"):
+            raise RuntimeError("Legacy classifier lacks data_sha256; cannot verify original-image provenance. Rebuild once with this version.")
+        mismatches = {k: (v, stored.get(k)) for k, v in metadata.items()
+                      if k not in {"git_commit", "config_hash"} and stored.get(k) != v}
+        if mismatches:
+            raise RuntimeError(f"Incompatible explicit classifier: {mismatches}")
+        if payload.get("state_sha256") != state_sha256(payload["value"]):
+            raise RuntimeError("Explicit classifier state SHA256 mismatch")
+        net = ClassifyNet(args.num_classes, pretrained=False).to(args.device)
+        net.load_state_dict(payload["value"])
+        print(f"Loaded explicit classifier: {explicit}; state sha256={state_sha256(net.state_dict())}")
+        return net
     if not args.force_recompute:
         cached_state = load_cache(cache_path, metadata)
         if cached_state is not None:
-            net = ClassifyNet(args.num_classes).to(args.device)
+            net = ClassifyNet(args.num_classes, pretrained=False).to(args.device)
             net.load_state_dict(cached_state)
             print(f"Loaded audited classifier cache: {cache_path}")
             return net
 
+    if getattr(args, "relation_diagnostics_only", False):
+        raise RuntimeError("Diagnostics-only requires an audited classifier cache; training is disabled")
     net = ClassifyNet(args.num_classes).to(args.device)
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.RMSprop(net.parameters(), lr=args.lr, weight_decay=1e-5)
@@ -215,6 +243,10 @@ def load_explicit_similarity_cache(args, path):
 
 def GenerateSimilarityMatrix(args, train_loader, relation_loader, val_loader):
     if args.similarity_cache:
+        auxiliary = getattr(getattr(relation_loader, "dataset", None), "auxiliary", None)
+        if auxiliary:
+            from utils.foreground_aux import save_previews
+            save_previews(auxiliary, args.run_dir)
         return load_explicit_similarity_cache(args, args.similarity_cache)
     if getattr(args, "variant", "b0") == "b1":
         from utils.reliable_relation import generate_i1

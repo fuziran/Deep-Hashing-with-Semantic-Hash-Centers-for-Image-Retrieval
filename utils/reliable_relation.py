@@ -28,7 +28,7 @@ def state_sha256(state):
 
 
 def relation_config(args):
-    return {
+    config = {
         "version": VERSION,
         "mode": args.relation_mode,
         "kappa": args.relation_kappa,
@@ -41,6 +41,14 @@ def relation_config(args):
         "normalization_std": [0.229, 0.224, 0.225],
         "feature_source": "ClassifyNet.feature_layers.pooled_flatten",
     }
+    if getattr(args, "aux_manifest", None):
+        config["auxiliary"] = {
+            "version": "foreground-aux-v1", "alpha": args.aux_alpha,
+            "content_sha256": args.aux_content_sha256, "count": args.aux_count,
+            "branch": "probability_only", "view": "resize_center_crop_single",
+            "quality": "manifest_approved_binary",
+        }
+    return config
 
 
 def validate_similarity(matrix, classes):
@@ -119,13 +127,18 @@ def estimate_relations(net, loader, args):
         raise ValueError("I1 requires >=2 classes and a known relation mode")
     # CPU float64 accumulation avoids CUDA index_add atomic reduction order.
     sums = {name: torch.zeros(classes, classes, dtype=torch.float64)
-            for name in ("baseline", "unweighted", "weighted")}
+            for name in ("baseline", "unweighted", "weighted", "original_weighted")}
     counts = torch.zeros(classes, dtype=torch.float64)
     stats = {name: torch.zeros_like(counts)
              for name in ("weight", "js", "consistency", "confidence", "agreement", "floor")}
     feature_sum = None
+    auxiliary = getattr(getattr(loader, "dataset", None), "auxiliary", None)
+    if getattr(args, "aux_manifest", None) and auxiliary is None:
+        raise ValueError("Declared auxiliary views were not loaded")
+    alpha = getattr(args, "aux_alpha", 0.0) if auxiliary else 0.0
+    aux_rows, seen = [], set()
     net.eval()
-    for images, labels, _ in loader:
+    for images, labels, indices in loader:
         if (labels.ndim != 2 or labels.shape[1] != classes
                 or not torch.isfinite(labels).all()
                 or not ((labels == 0) | (labels == 1)).all()
@@ -149,6 +162,34 @@ def estimate_relations(net, loader, args):
         averaged = (batch["a1"] + batch["a2"]) / 2
         sums["baseline"].index_add_(0, targets, batch["baseline"])
         sums["unweighted"].index_add_(0, targets, averaged)
+        sums["original_weighted"].index_add_(0, targets, averaged * batch["weight"][:, None])
+        if auxiliary:
+            positions = [i for i, idx in enumerate(indices.tolist()) if idx in auxiliary["tensors"]]
+            if positions:
+                ids = [int(indices[i]) for i in positions]
+                if seen.intersection(ids):
+                    raise ValueError("Auxiliary training index repeated by relation loader")
+                seen.update(ids)
+                aux_images = torch.stack([auxiliary["tensors"][idx] for idx in ids]).to(args.device)
+                aux_logits, _ = net.forward_with_features(aux_images)
+                aux_logits = aux_logits.detach().cpu().double()
+                aux_stats = view_statistics(aux_logits, aux_logits, targets[positions],
+                                            args.relation_temperature, args.relation_weight_floor,
+                                            args.mask_strategy)
+                # alpha=0 deliberately skips arithmetic to preserve B1 bit-for-bit.
+                if alpha != 0:
+                    averaged = averaged.clone()
+                    averaged[positions] = (1 - alpha) * averaged[positions] + alpha * aux_stats["a1"]
+                original_probs = (z1[positions] / args.relation_temperature).softmax(1)
+                aux_probs = (aux_logits / args.relation_temperature).softmax(1)
+                for j, (pos, idx) in enumerate(zip(positions, ids)):
+                    target = int(targets[pos])
+                    aux_rows.append({"index": idx, "class_id": target,
+                        "original_prediction": int(original_probs[j].argmax()),
+                        "auxiliary_prediction": int(aux_probs[j].argmax()),
+                        "original_true_class_confidence": float(original_probs[j, target]),
+                        "auxiliary_true_class_confidence": float(aux_probs[j, target]),
+                        "original_two_view_weight": float(batch["weight"][pos])})
         sums["weighted"].index_add_(0, targets, averaged * batch["weight"][:, None])
         features = (F.normalize(f1, dim=1, eps=1e-12)
                     + F.normalize(f2, dim=1, eps=1e-12)) / 2
@@ -163,6 +204,8 @@ def estimate_relations(net, loader, args):
 
     if (counts == 0).any():
         raise ValueError(f"No Stage 1 samples for classes: {torch.where(counts == 0)[0].tolist()}")
+    if auxiliary and seen != set(auxiliary["tensors"]):
+        raise ValueError("Relation loader did not visit every declared auxiliary index")
     prototypes = feature_sum / counts[:, None]
     if (prototypes.norm(dim=1) <= 1e-12).any():
         raise ValueError("Zero class prototype norm")
@@ -179,7 +222,7 @@ def estimate_relations(net, loader, args):
     }[args.relation_mode].float()
     for matrix in (s0, s_unweighted, s_prob, s_feat, s1, selected):
         validate_similarity(matrix, classes)
-    return {
+    artifact = {
         "similarity": selected, "S0": s0, "S_prob": s_prob,
         "S_feat": s_feat, "S1": s1, "S_two_view": s_unweighted,
         "class_count": counts, "e_c": stats["weight"], "gate": gate,
@@ -187,12 +230,34 @@ def estimate_relations(net, loader, args):
         "view_statistics": {k: v / counts for k, v in stats.items()},
         "relation_config": relation_config(args),
     }
+    if auxiliary:
+        original_prob = norm(sums["original_weighted"] / stats["weight"][:, None].clamp_min(1e-12))
+        original_s1, _ = fuse_relations(original_prob, s_feat, stats["weight"], args.relation_kappa)
+        coverage = torch.bincount(torch.tensor([r["class_id"] for r in aux_rows]), minlength=classes)
+        def differences(left, right):
+            delta = (left - right).abs()
+            return {"max_abs": float(delta.max()), "mean_abs": float(delta.mean()),
+                    "per_class_mean_abs": delta.mean(1).tolist()}
+        artifact.update({"S_prob_original": original_prob, "S1_original": original_s1,
+            "auxiliary_diagnostics": {"alpha": alpha, "count": len(aux_rows),
+                "content_sha256": auxiliary["sha256"],
+                "class_aux_count": coverage.tolist(),
+                "class_train_count": counts.tolist(),
+                "class_coverage": (coverage / counts).tolist(),
+                "probability_relation_change": differences(s_prob, original_prob),
+                "fused_relation_change": differences(s1, original_s1),
+                "samples": sorted(aux_rows, key=lambda r: r["index"])}})
+    return artifact
 
 
 def generate_i1(args, train_loader, relation_loader, val_loader):
     from GenerateSimilarityMatrix import TrainClassificationNetwork
     from utils.experiment import build_cache_metadata, load_cache, save_cache
 
+    auxiliary = getattr(getattr(relation_loader, "dataset", None), "auxiliary", None)
+    if auxiliary:
+        from utils.foreground_aux import save_previews
+        save_previews(auxiliary, args.run_dir)
     net = TrainClassificationNetwork(args, train_loader, val_loader)
     args.classifier_sha256 = state_sha256(net.state_dict())
     metadata = build_cache_metadata(args, "similarity")
@@ -223,5 +288,7 @@ def restore_artifact(args, artifact, metadata):
     args.similarity_content_sha256 = digest
     args.classifier_sha256 = metadata["classifier_sha256"]
     torch.save(artifact, os.path.join(args.run_dir, "stage1_diagnostics.pt"))
+    from utils.foreground_aux import export_diagnostics
+    export_diagnostics(artifact, args.run_dir)
     print(f"I1 relation mode={args.relation_mode}, content sha256={digest}")
     return similarity
