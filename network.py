@@ -80,13 +80,16 @@ class ResNet(nn.Module):
         # self.layer_hash.bias.data.fill_(0.0)
         # self.hash_layer = nn.Sequential(self.layer_hash, nn.BatchNorm1d(hash_bit, momentum=0.1))
 
-    def forward(self, x):
+    def forward_features(self, x):
+        return self.feature_layers(x).flatten(1)
 
-        x = self.feature_layers(x)
-        x = x.view(x.size(0), -1)
-        x = self.hash_layer(x)
-        # x = self.tanh(x)
-        return x
+    def forward_with_features(self, x):
+        features = self.forward_features(x)
+        return self.hash_layer(features), features
+
+    def forward(self, x):
+        return self.hash_layer(self.forward_features(x))
+
 
 class NewNet(nn.Module):
     def __init__(self, hash_bit, pretrained=True):

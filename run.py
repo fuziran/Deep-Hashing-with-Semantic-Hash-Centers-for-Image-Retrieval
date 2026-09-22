@@ -82,7 +82,28 @@ def load_config():
         action="store_true",
         help="Disable deterministic algorithms; not recommended for reported B0 runs.",
     )
+    parser.add_argument("--center-cache", help="Audited B1 H1 cache; requires frozen S1 and Stage 3.")
+    parser.add_argument("--aux-weight", type=float, default=0.0)
+    parser.add_argument("--aux-target", choices=("coarse", "fine"), default="coarse",
+                        help="Fine classification is the auxiliary-task control.")
+    parser.add_argument("--aux-warmup-epochs", type=int, default=10)
+    parser.add_argument("--validation-only", action="store_true",
+                        help="Select using validation only; do not evaluate final queries.")
     args = parser.parse_args()
+    if not math.isfinite(args.aux_weight) or args.aux_weight < 0:
+        parser.error("--aux-weight must be finite and nonnegative")
+    if args.aux_warmup_epochs < 0:
+        parser.error("--aux-warmup-epochs must be nonnegative")
+    if args.epoch <= 0 or args.test_map <= 0:
+        parser.error("--epoch and --test-map must be positive")
+    if args.aux_weight > 0 and not args.center_cache:
+        parser.error("Auxiliary training requires explicit --center-cache and --similarity-cache")
+    if args.center_cache and (args.variant != "b1" or args.stage != "train"
+                              or not args.similarity_cache or args.force_recompute):
+        parser.error("--center-cache requires --variant b1 --stage train "
+                     "--similarity-cache, without --force-recompute")
+    if (args.center_cache or args.aux_weight > 0) and args.num_classes != 100:
+        parser.error("The coarse-aux protocol requires CIFAR-100 with 100 fine classes")
 
     for name in ("relation_kappa", "relation_temperature", "relation_weight_floor"):
         value = getattr(args, name)
@@ -165,12 +186,29 @@ def main():
             "lambd": args.lambd,
             "deterministic": not args.non_deterministic,
         })
+    if args.center_cache:
+        from utils.coarse_aux import file_sha256, load_official_mapping
+        args.fine_to_coarse = load_official_mapping(args.root)
+        args.center_cache_file_sha256 = file_sha256(args.center_cache)
+        args.similarity_cache_file_sha256 = file_sha256(args.similarity_cache)
+        run_config["fixed_stage3"] = {
+            "center_sha256": args.center_cache_file_sha256,
+            "similarity_sha256": args.similarity_cache_file_sha256,
+            "aux_weight": args.aux_weight, "aux_target": args.aux_target,
+            "aux_warmup_epochs": args.aux_warmup_epochs,
+            "fine_to_coarse": args.fine_to_coarse,
+            "hash_stage_seed_reset": True,
+        }
+    if args.validation_only:
+        run_config["validation_only"] = True
     args.run_id = stable_config_hash(run_config)
     args.run_dir = os.path.join(
         args.output_dir,
         "runs",
         f"{args.dataset}_{args.variant.upper()}_{args.code_length}bit_seed{args.seed}_{args.run_id}",
     )
+    if args.center_cache and os.path.exists(args.run_dir):
+        raise FileExistsError(f"Run directory already exists; use a new --output-dir: {args.run_dir}")
     write_run_manifest(args)
 
     similarity = GenerateSimilarityMatrix(
@@ -180,14 +218,18 @@ def main():
     if args.stage == "similarity":
         return
 
-    centers = GenerateSemanticHashCenters(args, similarity.to(args.device))
+    if args.center_cache:
+        from utils.coarse_aux import load_fixed_centers
+        centers = load_fixed_centers(args, args.center_cache)
+    else:
+        centers = GenerateSemanticHashCenters(args, similarity.to(args.device))
     from utils.reliable_relation import tensor_sha256
     args.center_content_sha256 = tensor_sha256(centers)
     write_run_manifest(args)
     if args.stage == "centers":
         return
 
-    if args.paired_stage_seeds:
+    if args.paired_stage_seeds or args.center_cache:
         seed_everything(args.seed, deterministic=not args.non_deterministic)
         train_loader.generator.manual_seed(args.seed)
     train_val(

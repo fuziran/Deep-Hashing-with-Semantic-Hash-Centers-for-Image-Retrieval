@@ -13,6 +13,8 @@ import torch.optim as optim
 import torch.optim.lr_scheduler as lr_scheduler
 from scipy.linalg import hadamard
 
+from utils.coarse_aux import auxiliary_weight, make_auxiliary_head, hierarchy_errors, file_sha256
+
 from utils.tools import CalcTopMapPerQuery, CalcTopMapWithPR, compute_result
 
 torch.multiprocessing.set_sharing_strategy("file_system")
@@ -80,6 +82,11 @@ def _evaluate(query_loader, database_loader, net, args, num_database):
     }
     if not all(np.isfinite(value) for value in metrics.values()):
         raise FloatingPointError(f"Non-finite retrieval metrics: {metrics}")
+    if getattr(args, "fine_to_coarse", None) is not None:
+        metrics["hierarchy_errors"] = hierarchy_errors(
+            query_binary.numpy(), query_label.numpy(), database_binary.numpy(),
+            database_label.numpy(), args.fine_to_coarse,
+        )
     return metrics, pr_data, query_binary, query_label, database_binary, database_label
 
 
@@ -111,10 +118,19 @@ def train_val(
     database_loader,
     num_database,
 ):
-    print("========== start SHC B0 network training ==========")
+    print("========== start SHC network training ==========")
     bit = args.code_length
     net = args.net(bit).to(args.device)
-    optimizer = optim.RMSprop(net.parameters(), lr=args.lr, weight_decay=1e-5)
+    aux_weight_max = getattr(args, "aux_weight", 0.0)
+    aux_target = getattr(args, "aux_target", "coarse")
+    aux_head = make_auxiliary_head(net, aux_weight_max, aux_target)
+    parameters = list(net.parameters())
+    if aux_head is not None:
+        aux_head = aux_head.to(args.device)
+        parameters += list(aux_head.parameters())
+    mapping = (torch.tensor(args.fine_to_coarse, device=args.device, dtype=torch.long)
+               if aux_head is not None and aux_target == "coarse" else None)
+    optimizer = optim.RMSprop(parameters, lr=args.lr, weight_decay=1e-5)
     scheduler = lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=args.epoch, eta_min=1e-7
     )
@@ -126,6 +142,8 @@ def train_val(
 
     best_validation_map = float("-inf")
     best_epoch = 0
+    best_validation_metrics = None
+    best_aux_state = None
     best_state = {key: value.detach().cpu().clone() for key, value in net.state_dict().items()}
     history, losses, learning_rates = [], [], []
 
@@ -134,12 +152,31 @@ def train_val(
         learning_rates.append(optimizer.param_groups[0]["lr"])
         net.train()
         total_loss = 0.0
+        base_loss_sum, aux_loss_sum, aux_correct, aux_samples = 0.0, 0.0, 0, 0
+        weight = auxiliary_weight(aux_weight_max, getattr(args, "aux_warmup_epochs", 0), epoch)
+        if aux_head is not None:
+            aux_head.train()
         for images, labels, indices in train_loader:
             images = images.to(args.device, non_blocking=True)
             labels = labels.to(args.device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
-            output = net(images)
-            loss = criterion(output, labels, indices, args)
+            if aux_head is None:
+                output = net(images)
+                loss = criterion(output, labels, indices, args)
+                base_loss_sum += loss.item()
+            else:
+                output, features = net.forward_with_features(images)
+                base_loss = criterion(output, labels, indices, args)
+                targets = labels.argmax(dim=1)
+                if mapping is not None:
+                    targets = mapping[targets]
+                logits = aux_head(features)
+                aux_loss = torch.nn.functional.cross_entropy(logits, targets)
+                loss = base_loss + weight * aux_loss
+                base_loss_sum += base_loss.item()
+                aux_loss_sum += aux_loss.item() * targets.numel()
+                aux_correct += (logits.argmax(1) == targets).sum().item()
+                aux_samples += targets.numel()
             if not torch.isfinite(loss):
                 raise FloatingPointError(f"Non-finite hash loss at epoch {epoch + 1}")
             loss.backward()
@@ -156,6 +193,13 @@ def train_val(
             "lr": learning_rates[-1],
             "seconds": time.time() - started,
         }
+        if aux_head is not None:
+            record["auxiliary"] = {
+                "target": aux_target, "weight": weight,
+                "base_loss": base_loss_sum / max(len(train_loader), 1),
+                "cross_entropy": aux_loss_sum / max(aux_samples, 1),
+                "train_accuracy": aux_correct / max(aux_samples, 1),
+            }
         if should_validate:
             validation_metrics, _, _, _, _, _ = _evaluate(
                 val_loader, database_loader, net, args, num_database
@@ -164,6 +208,10 @@ def train_val(
             if validation_metrics["mAP@ALL"] > best_validation_map:
                 best_validation_map = validation_metrics["mAP@ALL"]
                 best_epoch = epoch + 1
+                best_validation_metrics = copy.deepcopy(validation_metrics)
+                if aux_head is not None:
+                    best_aux_state = {key: value.detach().cpu().clone()
+                                      for key, value in aux_head.state_dict().items()}
                 best_state = {
                     key: value.detach().cpu().clone() for key, value in net.state_dict().items()
                 }
@@ -176,49 +224,50 @@ def train_val(
         else:
             print(f"{args.info} epoch={epoch + 1} loss={epoch_loss:.5f}")
         history.append(record)
+        # Persist development progress even if a long remote job is interrupted.
+        os.makedirs(args.run_dir, exist_ok=True)
+        with open(os.path.join(args.run_dir, "training_history.json"), "w", encoding="utf-8") as f:
+            json.dump(history, f, ensure_ascii=False, indent=2)
 
     net.load_state_dict(best_state)
     net.to(args.device)
-    final_metrics, pr_data, query_binary, query_label, database_binary, database_label = (
-        _evaluate(query_loader, database_loader, net, args, num_database)
-    )
-    per_query_ap = CalcTopMapPerQuery(
-        query_binary.numpy(),
-        query_label.numpy(),
-        database_binary.numpy(),
-        database_label.numpy(),
-        args.topK,
-    )
     summary = {
         "selected_epoch": best_epoch,
         "selection_metric": "validation mAP@ALL",
         "best_validation_mAP@ALL": best_validation_map,
-        "query_metrics": final_metrics,
+        "selected_validation_metrics": best_validation_metrics,
+        "query_evaluated": not getattr(args, "validation_only", False),
     }
-
     os.makedirs(args.run_dir, exist_ok=True)
+    # Inference checkpoint contains only the original hash network.
     torch.save(best_state, os.path.join(args.run_dir, "best_model_state.pt"))
-    torch.save(
-        {
-            "query_binary": query_binary,
-            "query_label": query_label,
-            "database_binary": database_binary,
-            "database_label": database_label,
-            "pr_data": pr_data,
-            "per_query_ap": per_query_ap,
-        },
-        os.path.join(args.run_dir, "retrieval_outputs.pt"),
-    )
+    summary["model_sha256"] = file_sha256(os.path.join(args.run_dir, "best_model_state.pt"))
+    if best_aux_state is not None:
+        torch.save({"state_dict": best_aux_state, "target": aux_target,
+                    "selected_epoch": best_epoch},
+                   os.path.join(args.run_dir, "best_auxiliary_head.pt"))
+    if not getattr(args, "validation_only", False):
+        final_metrics, pr_data, query_binary, query_label, database_binary, database_label = (
+            _evaluate(query_loader, database_loader, net, args, num_database)
+        )
+        per_query_ap = CalcTopMapPerQuery(
+            query_binary.numpy(), query_label.numpy(), database_binary.numpy(),
+            database_label.numpy(), args.topK,
+        )
+        summary["query_metrics"] = final_metrics
+        torch.save({
+            "query_binary": query_binary, "query_label": query_label,
+            "database_binary": database_binary, "database_label": database_label,
+            "pr_data": pr_data, "per_query_ap": per_query_ap,
+        }, os.path.join(args.run_dir, "retrieval_outputs.pt"))
     with open(os.path.join(args.run_dir, "training_history.json"), "w", encoding="utf-8") as f:
         json.dump(history, f, ensure_ascii=False, indent=2)
     with open(os.path.join(args.run_dir, "metrics.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
     _save_curves(args.run_dir, losses, learning_rates)
 
-    print(
-        f"Selected epoch {best_epoch}; query mAP@ALL={final_metrics['mAP@ALL']:.5f}, "
-        f"mAP@100={final_metrics['mAP@100']:.5f}, "
-        f"mAP@1000={final_metrics['mAP@1000']:.5f}"
-    )
-    print("========== finished SHC B0 network training ==========")
+    print(f"Selected epoch {best_epoch}; validation mAP@ALL={best_validation_map:.5f}")
+    if summary["query_evaluated"]:
+        print(f"Final query metrics: {summary['query_metrics']}")
+    print("========== finished SHC network training ==========")
     return summary

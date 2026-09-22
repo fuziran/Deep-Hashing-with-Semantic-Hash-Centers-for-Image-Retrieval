@@ -45,6 +45,7 @@ def source_sha256():
         "run.py", "network.py", "GenerateSimilarityMatrix.py",
         "GenerateSemanticHashCenters.py", "train.py", "data/data_loader.py",
         "utils/experiment.py", "utils/tools.py", "utils/reliable_relation.py",
+        "utils/coarse_aux.py", "evaluate_saved.py",
     ):
         digest.update(relative.encode())
         # A checkout on Linux/Windows should have the same source identity.

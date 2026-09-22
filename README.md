@@ -64,6 +64,12 @@ If you want to create a custom dataset, please follow the data formats of the St
 
 ## Train
 
+### B1 coarse-category auxiliary learning
+
+See [COARSE_AUX.md](COARSE_AUX.md) for frozen S1/H1 reuse, validation-only
+B1/coarse/fine controls, and remote training commands. Auxiliary loss is off by default.
+
+
 ### Audited B0 baseline (CIFAR-100)
 
 The main B0 protocol reserves 10 images per class from the 10,000-image
