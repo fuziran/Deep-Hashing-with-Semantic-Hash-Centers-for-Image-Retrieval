@@ -119,7 +119,24 @@ def load_config():
     parser.add_argument("--nfd-topk", type=int, default=5)
     parser.add_argument("--nfd-warmup", type=int, default=20)
     parser.add_argument("--nfd-ramp-end", type=int, default=40)
+    parser.add_argument("--fine-aux-weight", type=float, default=0.0,
+                        help="Fine-label CE weight on pooled student features; 0 disables the head.")
+    parser.add_argument("--fine-aux-warmup", type=int, default=20)
+    parser.add_argument("--fine-aux-ramp-end", type=int, default=40)
     args = parser.parse_args()
+    from utils.fine_aux import VERSION as FINE_AUX_VERSION, fine_aux_weight
+    try:
+        fine_aux_weight(1, args.fine_aux_weight, args.fine_aux_warmup, args.fine_aux_ramp_end)
+        if args.fine_aux_weight > 0:
+            if args.variant != "b2nfd":
+                raise ValueError("Fine auxiliary classification requires --variant b2nfd")
+            if args.epoch < args.fine_aux_ramp_end:
+                raise ValueError("Epoch budget must cover the fine auxiliary ramp")
+    except ValueError as error:
+        parser.error(str(error))
+    if args.fine_aux_weight > 0:
+        args.fine_aux_version = FINE_AUX_VERSION
+        args.fine_aux_policy = "single-label-ce-shared-pooled-features-training-only"
     if args.variant == "b2nfd":
         from utils.neighbor_feature_distill import VERSION, nfd_weight
         try:
@@ -300,6 +317,9 @@ def main():
             "center_content_sha256": args.center_content_sha256,
             "similarity_content_sha256": args.similarity_content_sha256,
         })
+    if args.fine_aux_weight > 0:
+        run_config.update({key: value for key, value in vars(args).items()
+                           if key.startswith("fine_aux_")})
     args.run_id = stable_config_hash(run_config)
     args.run_dir = os.path.join(
         args.output_dir,

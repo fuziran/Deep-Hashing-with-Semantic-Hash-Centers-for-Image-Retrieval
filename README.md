@@ -1,3 +1,7 @@
+## Fine-label auxiliary + distillation
+
+See [FINE_AUX_DISTILLATION.md](FINE_AUX_DISTILLATION.md) for B1 + fine-label auxiliary + ordinary distillation / NFD, training options and verification.
+
 # Deep Hashing with Semantic Hash Centers for Image Retrieval
 
 ## Overview

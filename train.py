@@ -20,6 +20,8 @@ from utils.semantic_mixup import SemanticMixup, mix_weight, backward_mix
 from utils.semantic_rank import SemanticRank, rank_weight, sampled_gradient_diagnostics
 from utils.rank_checkpoint import atomic_save, save_checkpoint, restore_checkpoint
 
+from utils.fine_aux import build_fine_aux, fine_aux_loss, fine_aux_weight
+
 torch.multiprocessing.set_sharing_strategy("file_system")
 
 
@@ -190,7 +192,16 @@ def train_val(
     if (getattr(args, "variant", "b0") == "b2nfd") != (nfd is not None):
         raise ValueError("NFD variant requires exactly one prepared frozen distiller")
     net = args.net(bit).to(args.device)
-    optimizer = optim.RMSprop(net.parameters(), lr=args.lr, weight_decay=1e-5)
+    fine_head = None
+    if getattr(args, "fine_aux_weight", 0) > 0:
+        if nfd is None:
+            raise ValueError("Fine auxiliary classification requires the frozen distiller")
+        fine_head = build_fine_aux(net.hash_layer.in_features, args.num_classes,
+                                   args.seed, args.device)
+    parameters = list(net.parameters())
+    if fine_head is not None:
+        parameters += list(fine_head.parameters())
+    optimizer = optim.RMSprop(parameters, lr=args.lr, weight_decay=1e-5)
     scheduler = lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=args.epoch, eta_min=1e-7
     )
@@ -250,11 +261,25 @@ def train_val(
                 from utils.neighbor_feature_distill import nfd_weight
                 nfd_strength = nfd_weight(epoch + 1, args.nfd_weight,
                                           args.nfd_warmup, args.nfd_ramp_end)
-            if nfd_strength > 0:
+            fine_strength = (fine_aux_weight(epoch + 1, args.fine_aux_weight,
+                                            args.fine_aux_warmup, args.fine_aux_ramp_end)
+                             if fine_head is not None else 0.0)
+            if nfd_strength > 0 or fine_strength > 0:
                 output, features = net.forward_with_features(images)
             else:
                 output = net(images)
             loss = criterion(output, labels, indices, args)
+            if fine_head is not None:
+                fine_loss = output.new_zeros(())
+                fine_accuracy = output.new_zeros(())
+                if fine_strength > 0:
+                    fine_loss, fine_accuracy = fine_aux_loss(fine_head, features, labels)
+                    loss = loss + fine_strength * fine_loss
+                criterion.components.update({
+                    "loss_fine_aux": fine_loss.detach().item(),
+                    "fine_aux_weight": fine_strength,
+                    "fine_aux_accuracy": fine_accuracy.detach().item(),
+                })
             if not torch.isfinite(loss):
                 raise FloatingPointError(f"Non-finite hash loss at epoch {epoch + 1}")
             auxiliary_loss = 0.0
@@ -366,6 +391,11 @@ def train_val(
                 }
                 if ranker is not None or nfd is not None:
                     atomic_save(best_state, os.path.join(args.run_dir, "best_model_state.pt"))
+                if fine_head is not None:
+                    atomic_save({"epoch": epoch + 1,
+                                 "state_dict": {key: value.detach().cpu().clone()
+                                                for key, value in fine_head.state_dict().items()}},
+                                os.path.join(args.run_dir, "best_fine_aux_state.pt"))
             print(
                 f"{args.info} epoch={epoch + 1} loss={epoch_loss:.5f} "
                 f"val_ALL={validation_metrics['mAP@ALL']:.5f} "
