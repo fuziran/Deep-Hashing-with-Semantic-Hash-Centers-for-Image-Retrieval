@@ -40,7 +40,10 @@ def load_config():
     parser.add_argument("--crop-size", default=224, type=int)
     parser.add_argument("--gpu", default=0, type=int)
     parser.add_argument("--cpu", action="store_true")
-    parser.add_argument("--val-per-class", default=10, type=int)
+    parser.add_argument(
+        "--val-per-class", default=None, type=int,
+        help="Training images held out per class: CIFAR-100 defaults to 10, NABirds-B to 2.",
+    )
     parser.add_argument(
         "--mask-strategy",
         choices=("predicted_argmax", "ground_truth"),
@@ -72,6 +75,9 @@ def load_config():
         help="Disable deterministic algorithms; not recommended for reported B0 runs.",
     )
     args = parser.parse_args()
+
+    if args.val_per_class is None:
+        args.val_per_class = 2 if args.dataset.lower() == "nabirds-b" else 10
 
     if args.force_recompute and args.similarity_cache:
         parser.error("--force-recompute and --similarity-cache cannot be used together")

@@ -91,37 +91,47 @@ binary codes are written under `save/`. Use `--stage similarity` or
 `--stage centers` to stop after a diagnostic stage, and use
 `--force-recompute` only when intentionally replacing a matching cache.
 
-### Legacy command
+### Audited B0 baseline (NABirds-B)
 
-You can easily train and test SHC just by
-```
-python run.py --dataset NAbirds-official-seg \
-              --num_classes 100 \
-              --code_length 32 \
-              --lr 1e-4 \
-              --epoch 100 \
-              --classify_epoch 100 \
-              --test_map 5 \
-              --beta 1.00 \
-              --lambd 1e-4 \
-              --topk 100 \
-              --batch-size 64 \
-              --gpu 0
+Use the curated NABirds-B archive, with `train/`, `query/`, and `database/`
+directories under `images/`. The training directory must contain 555 class
+subdirectories; query classes must have matching training and database classes.
+The loader uses these existing splits; it never resamples the
+paper's B split from raw NABirds. It reserves two images per class from `train/`
+for validation, using `--seed 60`. The validation images are excluded from
+training and from the retrieval database. The query set is evaluated only after
+the best Stage 3 checkpoint has been chosen on validation mAP@ALL.
+
+From the repository root on the GPU machine, set `NABIRDS_ROOT` to the extracted
+archive's `images` directory. The commands below run all three code lengths in
+separate run directories and leave the CIFAR-100 outputs untouched:
+
+```bash
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
+NABIRDS_ROOT=/absolute/path/to/NABirds-B/images
+for bits in 16 32 64; do
+  python3 run.py --dataset NABirds-B --root "$NABIRDS_ROOT" \
+    --num-classes 555 --code-length "$bits" --seed 60 \
+    --lr 1e-4 --classify-epoch 300 --epoch 300 --test-map 5 \
+    --beta 1.0 --lambd 1e-4 --batch-size 64 --num-workers 4 \
+    --resize-size 256 --crop-size 224 --val-per-class 2 \
+    --topK -1 100 1000 --gpu 0 --output-dir ./save_nabirds_b
+done
 ```
 
-  Options:
-  
-  - `--dataset`: dataset name
-  - `--num_classes`: number of dataset categories
-  - `--code_length`: code length of hash.
-  - `--lr`: learning rate.
-  - `--epoch`: training epochs of the hashing network in stage 3.
-  - `--classify_epoch`: training epochs of the classification network in stage 1.
-  - `--beta`: hyperparameters.
-  - `--lambd`: hyperparameters.
-  - `--topk`: the topk number of retrieval images
-  - `--batch_size`: the number of videos in a batch.
-  - `--gpu`: choose the gpu to use.
+The loader writes the sorted class mapping, relative image paths, split
+indices, counts, and split SHA256 under `save_nabirds_b/splits/`. Check the
+printed counts against the extracted archive before committing to a long run.
+The PDF reports 16,384 train, 8,171 query, and 25,612 database images, but
+those counts do not sum to the 48,562 images it reports for the official A
+split. This code records the actual supplied B archive counts instead of
+silently changing its splits. After reserving validation, Stage 3 reports
+`mAP@ALL`, `mAP@100`, and `mAP@1000` in each run's `metrics.json`.
+
+The PDF uses a `1e-4` learning rate for non-CIFAR datasets, 300 epochs in
+Stages 1 and 3, batch size 64, and quantization weight `1e-4`. The fixed
+validation holdout and checkpoint selection follow this repository's audited
+B0 protocol and may differ from the paper's exact evaluation procedure.
 
 ## Precision Recall Curve
 the Precision Recall Curve in SHC is here:

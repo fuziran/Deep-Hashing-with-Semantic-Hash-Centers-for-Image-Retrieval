@@ -5,5 +5,6 @@ __pycache__/
 data/cifar-100-python/
 data/NABirds-B/
 save/
+save_nabirds_b/
 *.whl
 *.log
