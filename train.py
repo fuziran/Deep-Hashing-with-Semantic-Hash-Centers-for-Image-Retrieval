@@ -111,7 +111,7 @@ def train_val(
     database_loader,
     num_database,
 ):
-    print("========== start SHC B0 network training ==========")
+    print(f"========== start SHC {getattr(args, 'variant', 'b0').upper()} network training ==========")
     bit = args.code_length
     net = args.net(bit).to(args.device)
     optimizer = optim.RMSprop(net.parameters(), lr=args.lr, weight_decay=1e-5)
@@ -220,5 +220,5 @@ def train_val(
         f"mAP@100={final_metrics['mAP@100']:.5f}, "
         f"mAP@1000={final_metrics['mAP@1000']:.5f}"
     )
-    print("========== finished SHC B0 network training ==========")
+    print(f"========== finished SHC {getattr(args, 'variant', 'b0').upper()} network training ==========")
     return summary
