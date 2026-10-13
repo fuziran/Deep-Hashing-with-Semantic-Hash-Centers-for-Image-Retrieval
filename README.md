@@ -156,6 +156,38 @@ inspect the saved effective class counts and fusion gates before interpreting
 the relation mechanism. Select checkpoints on validation mAP@ALL and use the
 query set only for final reporting.
 
+On a Linux GPU machine with this branch checked out, run the paired B0/B1
+comparison from the repository root. Point `NABIRDS_ROOT` at the extracted
+archive directory containing `train/`, `query/`, and `database/` (or its
+parent). Both variants use the same held-out validation split, classifier,
+MDS initialization, training budget, and Stage 3 random seed. The new output
+directory keeps these runs separate from earlier B0 results.
+
+```bash
+git switch NABirds-B-update-reliable-relation
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
+NABIRDS_ROOT=/absolute/path/to/NABirds-B/images
+for variant in b0 b1; do
+  for bits in 16 32 64; do
+    python3 run.py --variant "$variant" --dataset NABirds-B \
+      --root "$NABIRDS_ROOT" --num-classes 555 --code-length "$bits" \
+      --seed 60 --lr 1e-4 --classify-epoch 300 --epoch 300 \
+      --test-map 5 --beta 1.0 --lambd 1e-4 --batch-size 64 \
+      --num-workers 4 --resize-size 256 --crop-size 224 \
+      --val-per-class 2 --mask-strategy predicted_argmax \
+      --topK -1 100 1000 --gpu 0 --paired-stage-seeds \
+      --output-dir ./save_nabirds_b_i1
+  done
+done
+```
+
+For B1, the default relation mode is `full`, with `kappa=30`, temperature
+`1`, and weight floor `0.05`. Each run writes its selected validation score
+and final query scores to `runs/*/metrics.json`. Inspect the B1
+`runs/*/stage1_diagnostics.pt` files for `class_count`, `e_c`, `gate`,
+`S_prob`, `S_feat`, and `S1` before changing relation settings. Any tuning
+should use validation results, leaving query results for final reporting.
+
 ## Precision Recall Curve
 the Precision Recall Curve in SHC is here:
 | ![16 bits, CIFAR-100](./save_figures/CIFAR-100/PR_bit_16.png) | ![32 bits, CIFAR-100](./save_figures/CIFAR-100/PR_bit_32.png) | ![64 bits, CIFAR-100](./save_figures/CIFAR-100/PR_bit_64.png) |
