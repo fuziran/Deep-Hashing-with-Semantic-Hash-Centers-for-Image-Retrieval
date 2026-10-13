@@ -133,6 +133,29 @@ Stages 1 and 3, batch size 64, and quantization weight `1e-4`. The fixed
 validation holdout and checkpoint selection follow this repository's audited
 B0 protocol and may differ from the paper's exact evaluation procedure.
 
+### Reliability-guided B1 on NABirds-B
+
+This branch also supports `--variant b1` for NABirds-B. B1 uses only the
+training portion of the curated split to estimate a two-view, reliability-
+weighted class relation and visual-feature relation. Their fused matrix
+replaces B0's Stage 1 matrix; Stage 2 and Stage 3 keep the same center and
+hash-network objectives. The classifier cache is shared by B0 and B1 when
+their training configuration matches, while the relation and center caches
+remain separate. B1 diagnostics are saved in `stage1_diagnostics.pt`.
+
+For a paired comparison, use the same code version, split, seed, and options
+for both variants, including `--paired-stage-seeds`. The flag resets the hash
+network initialization and training order after center generation. Retain
+`--val-per-class 2` for NABirds-B. Use a new output directory to keep the
+earlier B0 runs intact; their previous scores are useful context but are not
+the paired B0 result under this flag and code revision.
+
+The CIFAR-100 default of `--relation-kappa 30` is preserved here as a fixed
+starting configuration. NABirds-B has fewer training images per class, so
+inspect the saved effective class counts and fusion gates before interpreting
+the relation mechanism. Select checkpoints on validation mAP@ALL and use the
+query set only for final reporting.
+
 ## Precision Recall Curve
 the Precision Recall Curve in SHC is here:
 | ![16 bits, CIFAR-100](./save_figures/CIFAR-100/PR_bit_16.png) | ![32 bits, CIFAR-100](./save_figures/CIFAR-100/PR_bit_32.png) | ![64 bits, CIFAR-100](./save_figures/CIFAR-100/PR_bit_64.png) |

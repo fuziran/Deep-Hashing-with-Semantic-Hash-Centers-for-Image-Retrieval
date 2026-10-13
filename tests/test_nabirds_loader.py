@@ -9,6 +9,7 @@ import torch
 from PIL import Image
 
 from data.data_loader import _load_nabirds_data, _stratified_split_nabirds_train
+from utils.reliable_relation import estimate_relations, validate_similarity
 
 
 class TestNABirdsSplit(unittest.TestCase):
@@ -61,6 +62,26 @@ class TestNABirdsSplit(unittest.TestCase):
             self.assertEqual(manifest["counts"], {
                 "train": 6, "validation": 6, "query": 6, "database": 6,
             })
+
+            class TinyClassifier:
+                def eval(self):
+                    return self
+
+                def forward_with_features(self, images):
+                    features = images.mean(dim=(2, 3))
+                    return features, features
+
+            args.relation_mode = "full"
+            args.relation_kappa = 30.0
+            args.relation_temperature = 1.0
+            args.relation_weight_floor = 0.05
+            args.mask_strategy = "predicted_argmax"
+            relation_artifact = estimate_relations(TinyClassifier(), relation, args)
+            torch.testing.assert_close(
+                relation_artifact["class_count"],
+                torch.tensor([2., 2., 2.], dtype=torch.float64),
+            )
+            validate_similarity(relation_artifact["similarity"], args.num_classes)
 
 
 if __name__ == "__main__":

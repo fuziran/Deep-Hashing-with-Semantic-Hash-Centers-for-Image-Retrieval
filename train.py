@@ -126,7 +126,7 @@ def train_val(
 
     best_validation_map = float("-inf")
     best_epoch = 0
-    best_state = {key: value.detach().cpu() for key, value in net.state_dict().items()}
+    best_state = {key: value.detach().cpu().clone() for key, value in net.state_dict().items()}
     history, losses, learning_rates = [], [], []
 
     for epoch in range(args.epoch):
@@ -165,7 +165,7 @@ def train_val(
                 best_validation_map = validation_metrics["mAP@ALL"]
                 best_epoch = epoch + 1
                 best_state = {
-                    key: value.detach().cpu() for key, value in net.state_dict().items()
+                    key: value.detach().cpu().clone() for key, value in net.state_dict().items()
                 }
             print(
                 f"{args.info} epoch={epoch + 1} loss={epoch_loss:.5f} "
