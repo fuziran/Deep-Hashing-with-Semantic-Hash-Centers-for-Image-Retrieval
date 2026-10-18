@@ -154,6 +154,20 @@ class NFDTests(unittest.TestCase):
         with patch("sys.argv", ["run.py", "--dataset", "cifar-100-new-seg", "--cpu"]):
             self.assertEqual(load_config().variant, "b0")
 
+    def test_cpu_manifest_on_machine_with_available_cuda(self):
+        from utils.experiment import write_run_manifest
+
+        with tempfile.TemporaryDirectory() as directory:
+            args = argparse.Namespace(run_dir=directory, device=torch.device("cpu"))
+            with patch("utils.experiment.torch.cuda.is_available", return_value=True), \
+                 patch("utils.experiment.torch.cuda.get_device_name",
+                       side_effect=AssertionError("CPU manifest must not query a GPU")):
+                write_run_manifest(args)
+            manifest = json.loads((Path(directory) / "config.json").read_text())
+            self.assertEqual(manifest["device"], "cpu")
+            self.assertTrue(manifest["cuda_available"])
+            self.assertNotIn("gpu", manifest)
+
     def test_resnet_feature_path_keeps_forward_and_checkpoint_keys(self):
         import network
         from torchvision import models
