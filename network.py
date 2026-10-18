@@ -88,6 +88,14 @@ class ResNet(nn.Module):
         # x = self.tanh(x)
         return x
 
+    def forward_features(self, x):
+        """Return pooled features before the hash layer for I2-NFD."""
+        return self.feature_layers(x).flatten(1)
+
+    def forward_with_features(self, x):
+        features = self.forward_features(x)
+        return self.hash_layer(features), features
+
 class NewNet(nn.Module):
     def __init__(self, hash_bit, pretrained=True):
         super(NewNet, self).__init__()

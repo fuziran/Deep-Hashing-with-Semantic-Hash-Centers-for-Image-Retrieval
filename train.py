@@ -110,8 +110,11 @@ def train_val(
     query_loader,
     database_loader,
     num_database,
+    nfd=None,
 ):
     print(f"========== start SHC {getattr(args, 'variant', 'b0').upper()} network training ==========")
+    if (getattr(args, "variant", "b0") == "b2nfd") != (nfd is not None):
+        raise ValueError("I2-NFD requires exactly one prepared frozen distiller")
     bit = args.code_length
     net = args.net(bit).to(args.device)
     optimizer = optim.RMSprop(net.parameters(), lr=args.lr, weight_decay=1e-5)
@@ -134,14 +137,33 @@ def train_val(
         learning_rates.append(optimizer.param_groups[0]["lr"])
         net.train()
         total_loss = 0.0
+        nfd_totals = {key: 0.0 for key in (
+            "loss_nfd", "nfd_feature_mse", "nfd_projected_error", "nfd_mean_rank",
+        )} if nfd is not None else None
+        nfd_batches = 0
+        if nfd is not None:
+            from utils.neighbor_feature_distill import nfd_weight
+            strength = nfd_weight(epoch + 1, args.nfd_weight,
+                                  args.nfd_warmup, args.nfd_ramp_end)
         for images, labels, indices in train_loader:
             images = images.to(args.device, non_blocking=True)
             labels = labels.to(args.device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
-            output = net(images)
+            if nfd is not None and strength > 0:
+                output, features = net.forward_with_features(images)
+            else:
+                output = net(images)
             loss = criterion(output, labels, indices, args)
             if not torch.isfinite(loss):
                 raise FloatingPointError(f"Non-finite hash loss at epoch {epoch + 1}")
+            if nfd is not None and strength > 0:
+                auxiliary = nfd(features, images, labels.argmax(dim=1))
+                if not torch.isfinite(auxiliary):
+                    raise FloatingPointError(f"Non-finite NFD loss at epoch {epoch + 1}")
+                loss = loss + strength * auxiliary
+                for key in nfd_totals:
+                    nfd_totals[key] += nfd.components[key]
+                nfd_batches += 1
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
@@ -156,6 +178,13 @@ def train_val(
             "lr": learning_rates[-1],
             "seconds": time.time() - started,
         }
+        if nfd is not None:
+            record["nfd_weight"] = strength
+            record["loss_nfd"] = nfd_totals["loss_nfd"] / nfd_batches if nfd_batches else 0.0
+            record["weighted_nfd_loss"] = strength * record["loss_nfd"]
+            if nfd_batches:
+                for key in ("nfd_feature_mse", "nfd_projected_error", "nfd_mean_rank"):
+                    record[key] = nfd_totals[key] / nfd_batches
         if should_validate:
             validation_metrics, _, _, _, _, _ = _evaluate(
                 val_loader, database_loader, net, args, num_database
@@ -167,6 +196,8 @@ def train_val(
                 best_state = {
                     key: value.detach().cpu().clone() for key, value in net.state_dict().items()
                 }
+                if nfd is not None:
+                    torch.save(best_state, os.path.join(args.run_dir, "best_model_state.pt"))
             print(
                 f"{args.info} epoch={epoch + 1} loss={epoch_loss:.5f} "
                 f"val_ALL={validation_metrics['mAP@ALL']:.5f} "
@@ -176,6 +207,9 @@ def train_val(
         else:
             print(f"{args.info} epoch={epoch + 1} loss={epoch_loss:.5f}")
         history.append(record)
+        if nfd is not None:
+            with open(os.path.join(args.run_dir, "training_history.json"), "w", encoding="utf-8") as f:
+                json.dump(history, f, ensure_ascii=False, indent=2)
 
     net.load_state_dict(best_state)
     net.to(args.device)

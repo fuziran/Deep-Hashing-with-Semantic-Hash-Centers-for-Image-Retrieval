@@ -22,9 +22,9 @@ from utils.experiment import (
 
 
 def load_config():
-    parser = argparse.ArgumentParser(description="Audited SHC B0/B1 experiment")
+    parser = argparse.ArgumentParser(description="Audited SHC B0/B1 and NABirds-B I2-NFD experiment")
     parser.add_argument("--seed", default=60, type=int)
-    parser.add_argument("--variant", choices=("b0", "b1"), default="b0")
+    parser.add_argument("--variant", choices=("b0", "b1", "b2nfd"), default="b0")
     parser.add_argument("--relation-mode",
                         choices=("full", "two_view", "weighted", "fixed_fusion", "feature_only"),
                         default="full")
@@ -80,6 +80,17 @@ def load_config():
         help="Explicit audited Stage 1 cache to reuse after Stage 2-only changes.",
     )
     parser.add_argument("--force-recompute", action="store_true")
+    parser.add_argument("--parent-b1-config", default=None,
+                        help="Completed NABirds-B B1 run config.json used by I2-NFD.")
+    parser.add_argument("--center-cache", default=None,
+                        help="Audited B1 center cache for this code length.")
+    parser.add_argument("--teacher-cache", default=None,
+                        help="Audited classifier cache from the B1 parent.")
+    parser.add_argument("--nfd-alpha", type=float, default=0.75)
+    parser.add_argument("--nfd-weight", type=float, default=0.01)
+    parser.add_argument("--nfd-topk", type=int, default=5)
+    parser.add_argument("--nfd-warmup", type=int, default=20)
+    parser.add_argument("--nfd-ramp-end", type=int, default=40)
     parser.add_argument(
         "--non-deterministic",
         action="store_true",
@@ -89,6 +100,33 @@ def load_config():
 
     if args.val_per_class is None:
         args.val_per_class = 2 if args.dataset.lower() == "nabirds-b" else 10
+
+    if args.variant == "b2nfd":
+        from utils.neighbor_feature_distill import VERSION, nfd_weight
+        if args.dataset.lower() != "nabirds-b":
+            parser.error("--variant b2nfd is available only for NABirds-B")
+        if not all((args.parent_b1_config, args.similarity_cache,
+                    args.center_cache, args.teacher_cache)):
+            parser.error("I2-NFD requires --parent-b1-config, --similarity-cache, "
+                         "--center-cache, and --teacher-cache")
+        if args.force_recompute or args.stage not in ("all", "train"):
+            parser.error("I2-NFD reuses frozen B1 artifacts and supports only --stage all/train")
+        try:
+            nfd_weight(1, args.nfd_weight, args.nfd_warmup, args.nfd_ramp_end)
+            if not math.isfinite(args.nfd_alpha) or not 0 <= args.nfd_alpha < 1:
+                raise ValueError("--nfd-alpha must be finite in [0, 1)")
+            if not 0 < args.nfd_topk < args.num_classes:
+                raise ValueError("--nfd-topk must be between 1 and num-classes - 1")
+            if args.epoch < args.nfd_ramp_end:
+                raise ValueError("--epoch must cover the full NFD weight ramp")
+        except ValueError as error:
+            parser.error(str(error))
+        args.nfd_version = VERSION
+        args.nfd_feature_dim = 512
+        args.nfd_teacher_policy = "frozen-eval-same-augmented-input"
+        args.nfd_projection_policy = "i1-topk-prototype-differences-svd-trace-normalized"
+    elif any((args.parent_b1_config, args.center_cache, args.teacher_cache)):
+        parser.error("Parent B1, center, and teacher cache options require --variant b2nfd")
 
     for name in ("relation_kappa", "relation_temperature", "relation_weight_floor"):
         value = getattr(args, name)
@@ -100,7 +138,7 @@ def load_config():
         args.relation_mode != "full" or args.relation_kappa != 30.0
         or args.relation_temperature != 1.0 or args.relation_weight_floor != 0.05
     ):
-        parser.error("Relation options require --variant b1")
+        parser.error("Relation options require --variant b1/b2nfd")
     if args.info == "[SHC-B0]":
         args.info = f"[SHC-{args.variant.upper()}]"
 
@@ -139,6 +177,15 @@ def main():
         num_database,
     ) = load_data(args)
 
+    nfd = None
+    centers = None
+    if args.variant == "b2nfd":
+        from utils.frozen_b1 import load_frozen_b1
+        from utils.neighbor_feature_distill import load_nfd
+
+        _, centers = load_frozen_b1(args)
+        nfd = load_nfd(args)
+
     run_config = {
         "dataset": args.dataset,
         "seed": args.seed,
@@ -153,13 +200,13 @@ def main():
         "validation_per_class": args.val_per_class,
         "git_commit": args.git_commit,
     }
-    if args.variant == "b1":
+    if args.variant in ("b1", "b2nfd"):
         from utils.reliable_relation import relation_config
         run_config["variant"] = args.variant
         run_config["relation"] = relation_config(args)
     if args.paired_stage_seeds:
         run_config["paired_stage_seeds"] = True
-    if args.variant == "b1" or args.paired_stage_seeds:
+    if args.variant in ("b1", "b2nfd") or args.paired_stage_seeds:
         run_config.update({
             "source_sha256": args.source_sha256,
             "batch_size": args.batch_size,
@@ -171,22 +218,50 @@ def main():
             "lambd": args.lambd,
             "deterministic": not args.non_deterministic,
         })
+    if nfd is not None:
+        run_config.update({
+            "parent_b1_config_sha256": args.parent_b1_config_sha256,
+            "parent_b1_git_commit": args.parent_b1_git_commit,
+            "similarity_content_sha256": args.similarity_content_sha256,
+            "center_content_sha256": args.center_content_sha256,
+            "nfd_version": args.nfd_version,
+            "nfd_alpha": args.nfd_alpha,
+            "nfd_weight": args.nfd_weight,
+            "nfd_topk": args.nfd_topk,
+            "nfd_warmup": args.nfd_warmup,
+            "nfd_ramp_end": args.nfd_ramp_end,
+            "nfd_teacher_sha256": args.nfd_teacher_sha256,
+            "nfd_basis_sha256": args.nfd_basis_sha256,
+            "nfd_implementation_sha256": args.nfd_implementation_sha256,
+        })
     args.run_id = stable_config_hash(run_config)
     args.run_dir = os.path.join(
         args.output_dir,
         "runs",
         f"{args.dataset}_{args.variant.upper()}_{args.code_length}bit_seed{args.seed}_{args.run_id}",
     )
+    if nfd is not None and os.path.exists(args.run_dir):
+        raise FileExistsError(f"I2-NFD run already exists: {args.run_dir}")
     write_run_manifest(args)
 
-    similarity = GenerateSimilarityMatrix(
-        args, train_loader, relation_loader, val_loader
-    )
+    if nfd is not None:
+        torch.save(
+            {"identity": nfd.identity, "basis": nfd.basis.cpu().clone(),
+             "neighbors": nfd.neighbors.cpu().clone(), "ranks": nfd.ranks.cpu().clone()},
+            os.path.join(args.run_dir, "nfd_projection.pt"),
+        )
+        print(f"Loaded frozen NABirds-B B1 artifacts for I2-NFD: {args.parent_b1_config}")
+
+    if nfd is None:
+        similarity = GenerateSimilarityMatrix(
+            args, train_loader, relation_loader, val_loader
+        )
     write_run_manifest(args)
     if args.stage == "similarity":
         return
 
-    centers = GenerateSemanticHashCenters(args, similarity.to(args.device))
+    if nfd is None:
+        centers = GenerateSemanticHashCenters(args, similarity.to(args.device))
     from utils.reliable_relation import tensor_sha256
     args.center_content_sha256 = tensor_sha256(centers)
     write_run_manifest(args)
@@ -204,6 +279,7 @@ def main():
         query_loader,
         database_loader,
         num_database,
+        nfd=nfd,
     )
 
 
