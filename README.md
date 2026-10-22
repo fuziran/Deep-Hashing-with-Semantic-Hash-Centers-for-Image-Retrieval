@@ -64,6 +64,13 @@ If you want to create a custom dataset, please follow the data formats of the St
 
 ## Train
 
+### I3-NPA on I1 + NFD
+
+This branch adds `--variant b3npa` for neighborhood-protected implicit feature
+augmentation. See [NPA_README.md](NPA_README.md) for the method, exact disabled-NFD
+control, tests, commit/push commands and a launcher that inherits each existing
+16/32/64-bit NFD configuration. Retrieval improvements require real experiments.
+
 ### Audited B0 baseline (CIFAR-100)
 
 The main B0 protocol reserves 10 images per class from the 10,000-image

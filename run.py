@@ -25,7 +25,7 @@ from utils.experiment import (
 def load_config():
     parser = argparse.ArgumentParser(description="Faithful and auditable SHC B0 baseline")
     parser.add_argument("--seed", default=60, type=int)
-    parser.add_argument("--variant", choices=("b0", "b1", "b2", "b2r", "b2m", "b2sbr", "b2nfd"), default="b0")
+    parser.add_argument("--variant", choices=("b0", "b1", "b2", "b2r", "b2m", "b2sbr", "b2nfd", "b3npa"), default="b0")
     parser.add_argument("--relation-mode",
                         choices=("full", "two_view", "weighted", "fixed_fusion", "feature_only"),
                         default="full")
@@ -119,8 +119,27 @@ def load_config():
     parser.add_argument("--nfd-topk", type=int, default=5)
     parser.add_argument("--nfd-warmup", type=int, default=20)
     parser.add_argument("--nfd-ramp-end", type=int, default=40)
+    parser.add_argument("--npa-mode", choices=("protected", "covariance", "isotropic"), default="protected")
+    parser.add_argument("--npa-rho", type=float, default=.05)
+    parser.add_argument("--npa-shrinkage", type=float, default=.2)
+    parser.add_argument("--npa-weight", type=float, default=1.)
+    parser.add_argument("--npa-warmup", type=int, default=40)
+    parser.add_argument("--npa-ramp-end", type=int, default=60)
     args = parser.parse_args()
-    if args.variant == "b2nfd":
+    if args.variant == "b3npa":
+        from utils.neighborhood_protected_augmentation import VERSION, npa_weight
+        try:
+            npa_weight(1, args.npa_weight, args.npa_warmup, args.npa_ramp_end)
+            if not math.isfinite(args.npa_rho) or args.npa_rho < 0:
+                raise ValueError("NPA rho must be finite and nonnegative")
+            if not math.isfinite(args.npa_shrinkage) or not 0 <= args.npa_shrinkage <= 1:
+                raise ValueError("NPA shrinkage must be finite in [0,1]")
+            if args.npa_weight > 0 and args.npa_rho > 0 and args.epoch < args.npa_ramp_end:
+                raise ValueError("NPA epoch budget must cover its weight ramp")
+        except ValueError as error:
+            parser.error(str(error))
+        args.npa_version = VERSION
+    if args.variant in ("b2nfd", "b3npa"):
         from utils.neighbor_feature_distill import VERSION, nfd_weight
         try:
             nfd_weight(1, args.nfd_weight, args.nfd_warmup, args.nfd_ramp_end)
@@ -139,7 +158,7 @@ def load_config():
         args.nfd_teacher_policy = "frozen-eval-same-augmented-input"
         args.nfd_projection_policy = "i1-topk-prototype-differences-svd-trace-normalized"
     elif args.teacher_cache:
-        parser.error("--teacher-cache requires --variant b2nfd")
+        parser.error("--teacher-cache requires --variant b2nfd/b3npa")
     if args.resume_sbr and args.variant != "b2sbr":
         parser.error("--resume-sbr requires --variant b2sbr")
     if args.variant == "b2sbr":
@@ -184,7 +203,7 @@ def load_config():
         except ValueError as error:
             parser.error(str(error))
         args.i2r_version = VERSION
-    if args.variant in ("b2", "b2r", "b2m", "b2sbr", "b2nfd"):
+    if args.variant in ("b2", "b2r", "b2m", "b2sbr", "b2nfd", "b3npa"):
         if not all((args.parent_b1_config, args.similarity_cache, args.center_cache)):
             parser.error("B2/B2R/B2M/B2SBR/B2NFD requires --parent-b1-config, --similarity-cache and --center-cache")
         if not args.paired_stage_seeds or args.force_recompute:
@@ -266,13 +285,13 @@ def main():
         "validation_per_class": args.val_per_class,
         "git_commit": args.git_commit,
     }
-    if args.variant in ("b1", "b2", "b2r", "b2m", "b2sbr", "b2nfd"):
+    if args.variant in ("b1", "b2", "b2r", "b2m", "b2sbr", "b2nfd", "b3npa"):
         from utils.reliable_relation import relation_config
         run_config["variant"] = args.variant
         run_config["relation"] = relation_config(args)
     if args.paired_stage_seeds:
         run_config["paired_stage_seeds"] = True
-    if args.variant in ("b1", "b2", "b2r", "b2m", "b2sbr", "b2nfd") or args.paired_stage_seeds:
+    if args.variant in ("b1", "b2", "b2r", "b2m", "b2sbr", "b2nfd", "b3npa") or args.paired_stage_seeds:
         run_config.update({
             "source_sha256": args.source_sha256,
             "batch_size": args.batch_size,
@@ -285,17 +304,22 @@ def main():
             "deterministic": not args.non_deterministic,
         })
     nfd = None
+    npa = None
     if args.skip_query:
         run_config["skip_query"] = True
-    if args.variant in ("b2", "b2r", "b2m", "b2sbr", "b2nfd"):
+    if args.variant in ("b2", "b2r", "b2m", "b2sbr", "b2nfd", "b3npa"):
         from utils.frozen_b1 import load_frozen_b1
         similarity, centers = load_frozen_b1(args)
-        if args.variant == "b2nfd":
+        if args.variant in ("b2nfd", "b3npa"):
             from utils.neighbor_feature_distill import load_nfd
             nfd = load_nfd(args)
+        if args.variant == "b3npa":
+            from utils.neighborhood_protected_augmentation import prepare_npa
+            npa = prepare_npa(args, nfd, relation_loader, train_loader)
         run_config.update({key: value for key, value in vars(args).items()
                            if key.startswith("parent_")
-                           or key.startswith({"b2": "comp_", "b2r": "i2r_", "b2m": "mix_", "b2sbr": "rank_", "b2nfd": "nfd_"}[args.variant])})
+                           or key.startswith({"b2": "comp_", "b2r": "i2r_", "b2m": "mix_", "b2sbr": "rank_", "b2nfd": "nfd_", "b3npa": "npa_"}[args.variant])
+                           or (args.variant == "b3npa" and key.startswith("nfd_"))})
         run_config.update({
             "center_content_sha256": args.center_content_sha256,
             "similarity_content_sha256": args.similarity_content_sha256,
@@ -306,7 +330,7 @@ def main():
         "runs",
         f"{args.dataset}_{args.variant.upper()}_{args.code_length}bit_seed{args.seed}_{args.run_id}",
     )
-    if args.variant in ("b2", "b2r", "b2m", "b2sbr", "b2nfd") and os.path.exists(args.run_dir):
+    if args.variant in ("b2", "b2r", "b2m", "b2sbr", "b2nfd", "b3npa") and os.path.exists(args.run_dir):
         raise FileExistsError(f"Run already exists; choose a new --output-dir: {args.run_dir}")
     if args.variant == "b2sbr":
         print("SBR configuration=" + json.dumps({
@@ -317,13 +341,18 @@ def main():
                 "center_content_sha256", "skip_query", "resume_sbr")
         }, sort_keys=True))
     write_run_manifest(args)
+    if npa is not None:
+        torch.save(npa.artifact, os.path.join(args.run_dir, "npa_statistics.pt"))
+        del npa.artifact
+        print("NPA configuration=" + json.dumps({key: value for key, value in vars(args).items()
+                                                if key.startswith("npa_")}))
     if nfd is not None:
         torch.save({"identity": nfd.identity, "basis": nfd.basis.cpu().clone(),
                     "neighbors": nfd.neighbors.cpu().clone(), "ranks": nfd.ranks.cpu().clone()},
                    os.path.join(args.run_dir, "nfd_projection.pt"))
         print("NFD configuration=" + json.dumps(nfd.identity))
 
-    if args.variant not in ("b2", "b2r", "b2m", "b2sbr", "b2nfd"):
+    if args.variant not in ("b2", "b2r", "b2m", "b2sbr", "b2nfd", "b3npa"):
         similarity = GenerateSimilarityMatrix(
             args, train_loader, relation_loader, val_loader
         )
@@ -331,7 +360,7 @@ def main():
     if args.stage == "similarity":
         return
 
-    if args.variant not in ("b2", "b2r", "b2m", "b2sbr", "b2nfd"):
+    if args.variant not in ("b2", "b2r", "b2m", "b2sbr", "b2nfd", "b3npa"):
         centers = GenerateSemanticHashCenters(args, similarity.to(args.device))
     from utils.reliable_relation import tensor_sha256
     args.center_content_sha256 = tensor_sha256(centers)
@@ -350,8 +379,9 @@ def main():
         query_loader,
         database_loader,
         num_database,
-        similarity=similarity if args.variant in ("b2", "b2r", "b2m", "b2sbr", "b2nfd") else None,
+        similarity=similarity if args.variant in ("b2", "b2r", "b2m", "b2sbr", "b2nfd", "b3npa") else None,
         nfd=nfd,
+        npa=npa,
     )
 
 

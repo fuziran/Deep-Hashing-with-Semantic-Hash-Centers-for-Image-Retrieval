@@ -184,11 +184,17 @@ def train_val(
     num_database,
     similarity=None,
     nfd=None,
+    npa=None,
 ):
     print(f"========== start {args.info} network training ==========")
     bit = args.code_length
-    if (getattr(args, "variant", "b0") == "b2nfd") != (nfd is not None):
+    if (getattr(args, "variant", "b0") in ("b2nfd", "b3npa")) != (nfd is not None):
         raise ValueError("NFD variant requires exactly one prepared frozen distiller")
+    if npa is not None and getattr(args, "variant", "b0") != "b3npa":
+        raise ValueError("NPA requires the b3npa variant")
+    if (getattr(args, "variant", "b0") == "b3npa" and args.npa_weight > 0
+            and args.npa_rho > 0 and npa is None):
+        raise ValueError("Enabled NPA requires prepared training-only statistics")
     net = args.net(bit).to(args.device)
     optimizer = optim.RMSprop(net.parameters(), lr=args.lr, weight_decay=1e-5)
     scheduler = lr_scheduler.CosineAnnealingLR(
@@ -250,7 +256,12 @@ def train_val(
                 from utils.neighbor_feature_distill import nfd_weight
                 nfd_strength = nfd_weight(epoch + 1, args.nfd_weight,
                                           args.nfd_warmup, args.nfd_ramp_end)
-            if nfd_strength > 0:
+            npa_strength = 0.0
+            if npa is not None:
+                from utils.neighborhood_protected_augmentation import npa_weight
+                npa_strength = npa_weight(epoch + 1, args.npa_weight,
+                                          args.npa_warmup, args.npa_ramp_end)
+            if nfd_strength > 0 or npa_strength > 0:
                 output, features = net.forward_with_features(images)
             else:
                 output = net(images)
@@ -277,6 +288,7 @@ def train_val(
                     criterion.components["loss_rank"] = 0.0
                 criterion.components["rank_weight"] = rank_strength
             elif nfd is not None:
+                combined = loss
                 if nfd_strength > 0:
                     nfd_loss = nfd(features, images, labels.argmax(dim=1))
                     if not torch.isfinite(nfd_loss):
@@ -285,13 +297,28 @@ def train_val(
                     if batch_index == 0:
                         sample = sampled_gradient_diagnostics(loss, weighted_nfd, net.parameters())
                         gradient_sample = {key.replace("rank", "nfd"): value for key, value in sample.items()}
-                    (loss + weighted_nfd).backward()
+                    combined = combined + weighted_nfd
                     auxiliary_loss = weighted_nfd.detach().item()
                     criterion.components.update(nfd.components)
                 else:
-                    loss.backward()
                     criterion.components["loss_nfd"] = 0.0
                 criterion.components["nfd_weight"] = nfd_strength
+                if npa_strength > 0:
+                    npa_loss = npa(output, features, labels.argmax(dim=1),
+                                   net.hash_layer.weight, criterion.hash_targets)
+                    weighted_npa = npa_strength * npa_loss
+                    if batch_index == 0:
+                        sample = sampled_gradient_diagnostics(combined, weighted_npa, net.parameters())
+                        gradient_sample["sampled_npa_reference_grad_norm"] = sample["sampled_clean_grad_norm"]
+                        gradient_sample.update({key.replace("rank", "npa"): value for key, value in sample.items()
+                                                if key != "sampled_clean_grad_norm"})
+                    combined = combined + weighted_npa
+                    auxiliary_loss += weighted_npa.detach().item()
+                    criterion.components.update(npa.components)
+                if getattr(args, "variant", "b0") == "b3npa":
+                    criterion.components.setdefault("loss_npa", 0.0)
+                    criterion.components["npa_weight"] = npa_strength
+                combined.backward()
             else:
                 loss.backward()
             if mixer is not None:
