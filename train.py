@@ -185,10 +185,11 @@ def train_val(
     similarity=None,
     nfd=None,
     npa=None,
+    fcd=None,
 ):
     print(f"========== start {args.info} network training ==========")
     bit = args.code_length
-    if (getattr(args, "variant", "b0") in ("b2nfd", "b3npa")) != (nfd is not None):
+    if (getattr(args, "variant", "b0") in ("b2nfd", "b3npa", "b3fcd")) != (nfd is not None):
         raise ValueError("NFD variant requires exactly one prepared frozen distiller")
     if npa is not None and getattr(args, "variant", "b0") != "b3npa":
         raise ValueError("NPA requires the b3npa variant")
@@ -196,7 +197,14 @@ def train_val(
             and args.npa_rho > 0 and npa is None):
         raise ValueError("Enabled NPA requires prepared training-only statistics")
     net = args.net(bit).to(args.device)
-    optimizer = optim.RMSprop(net.parameters(), lr=args.lr, weight_decay=1e-5)
+    if fcd is not None and getattr(args,'variant','b0') != 'b3fcd':
+        raise ValueError('FCD requires b3fcd')
+    if getattr(args,'variant','b0') == 'b3fcd' and args.fcd_weight > 0 and fcd is None:
+        raise ValueError('Enabled FCD requires a validated teacher cache')
+    parameters = list(net.parameters())
+    if fcd is not None:
+        parameters += list(fcd.head.parameters())
+    optimizer = optim.RMSprop(parameters, lr=args.lr, weight_decay=1e-5)
     scheduler = lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=args.epoch, eta_min=1e-7
     )
@@ -318,6 +326,21 @@ def train_val(
                 if getattr(args, "variant", "b0") == "b3npa":
                     criterion.components.setdefault("loss_npa", 0.0)
                     criterion.components["npa_weight"] = npa_strength
+                if fcd is not None:
+                    from utils.foundation_distill import ramp
+                    fcd_strength = ramp(epoch+1,args.fcd_weight,args.fcd_warmup,args.fcd_ramp_end)
+                    if fcd_strength > 0:
+                        extra = fcd(output.tanh(),labels.argmax(1),indices)
+                        weighted_fcd = fcd_strength*extra
+                        if batch_index == 0:
+                            sample = sampled_gradient_diagnostics(combined,weighted_fcd,net.parameters())
+                            gradient_sample.update({'fcd_'+key: value for key,value in sample.items()})
+                        combined = combined+weighted_fcd
+                        auxiliary_loss += weighted_fcd.detach().item()
+                        criterion.components.update(fcd.components)
+                    else:
+                        criterion.components['loss_fcd'] = 0.
+                    criterion.components['fcd_weight'] = fcd_strength
                 combined.backward()
             else:
                 loss.backward()
@@ -393,6 +416,9 @@ def train_val(
                 }
                 if ranker is not None or nfd is not None:
                     atomic_save(best_state, os.path.join(args.run_dir, "best_model_state.pt"))
+                if fcd is not None:
+                    atomic_save({key:value.detach().cpu().clone() for key,value in fcd.head.state_dict().items()},
+                                os.path.join(args.run_dir,'fcd_selected_auxiliary_head.pt'))
             print(
                 f"{args.info} epoch={epoch + 1} loss={epoch_loss:.5f} "
                 f"val_ALL={validation_metrics['mAP@ALL']:.5f} "

@@ -64,6 +64,14 @@ If you want to create a custom dataset, please follow the data formats of the St
 
 ## Train
 
+### I3-FCD on I1 + NFD
+
+`--variant b3fcd` adds a training-only classifier on hash codes and offline
+foundation-model discriminative distillation. See [FCD_README.md](FCD_README.md)
+for teacher preparation/checks, the separate DINOv3 environment, exact reference
+paths and three-code-length commands. Plain DKD and CE-only controls are included;
+the candidate's retrieval benefit remains unverified.
+
 ### I3-NPA on I1 + NFD
 
 This branch adds `--variant b3npa` for neighborhood-protected implicit feature

@@ -25,7 +25,7 @@ from utils.experiment import (
 def load_config():
     parser = argparse.ArgumentParser(description="Faithful and auditable SHC B0 baseline")
     parser.add_argument("--seed", default=60, type=int)
-    parser.add_argument("--variant", choices=("b0", "b1", "b2", "b2r", "b2m", "b2sbr", "b2nfd", "b3npa"), default="b0")
+    parser.add_argument("--variant", choices=("b0", "b1", "b2", "b2r", "b2m", "b2sbr", "b2nfd", "b3npa", "b3fcd"), default="b0")
     parser.add_argument("--relation-mode",
                         choices=("full", "two_view", "weighted", "fixed_fusion", "feature_only"),
                         default="full")
@@ -125,7 +125,32 @@ def load_config():
     parser.add_argument("--npa-weight", type=float, default=1.)
     parser.add_argument("--npa-warmup", type=int, default=40)
     parser.add_argument("--npa-ramp-end", type=int, default=60)
+    parser.add_argument("--fcd-cache", default=None)
+    parser.add_argument("--fcd-mode", choices=("ce", "plain", "neighbor"), default="neighbor")
+    parser.add_argument("--fcd-weight", type=float, default=.05)
+    parser.add_argument("--fcd-temperature", type=float, default=2.)
+    parser.add_argument("--fcd-gamma", type=float, default=1.)
+    parser.add_argument("--fcd-topk", type=int, default=5)
+    parser.add_argument("--fcd-warmup", type=int, default=40)
+    parser.add_argument("--fcd-ramp-end", type=int, default=60)
     args = parser.parse_args()
+    if args.variant == "b3fcd":
+        from utils.foundation_distill import VERSION, ramp
+        try:
+            ramp(1,args.fcd_weight,args.fcd_warmup,args.fcd_ramp_end)
+            if not math.isfinite(args.fcd_temperature) or args.fcd_temperature <= 0:
+                raise ValueError("FCD temperature must be finite and positive")
+            if not math.isfinite(args.fcd_gamma) or not 0 <= args.fcd_gamma <= 1:
+                raise ValueError("FCD gamma must be finite in [0,1]")
+            if not 0 < args.fcd_topk < args.num_classes:
+                raise ValueError("FCD topk must be smaller than num-classes")
+            if args.fcd_weight > 0 and (not args.fcd_cache or args.epoch < args.fcd_ramp_end):
+                raise ValueError("Enabled FCD requires --fcd-cache and epoch budget covering ramp")
+        except ValueError as error:
+            parser.error(str(error))
+        args.fcd_version=VERSION
+    elif args.fcd_cache:
+        parser.error("--fcd-cache requires --variant b3fcd")
     if args.variant == "b3npa":
         from utils.neighborhood_protected_augmentation import VERSION, npa_weight
         try:
@@ -139,7 +164,7 @@ def load_config():
         except ValueError as error:
             parser.error(str(error))
         args.npa_version = VERSION
-    if args.variant in ("b2nfd", "b3npa"):
+    if args.variant in ("b2nfd", "b3npa", "b3fcd"):
         from utils.neighbor_feature_distill import VERSION, nfd_weight
         try:
             nfd_weight(1, args.nfd_weight, args.nfd_warmup, args.nfd_ramp_end)
@@ -203,7 +228,7 @@ def load_config():
         except ValueError as error:
             parser.error(str(error))
         args.i2r_version = VERSION
-    if args.variant in ("b2", "b2r", "b2m", "b2sbr", "b2nfd", "b3npa"):
+    if args.variant in ("b2", "b2r", "b2m", "b2sbr", "b2nfd", "b3npa", "b3fcd"):
         if not all((args.parent_b1_config, args.similarity_cache, args.center_cache)):
             parser.error("B2/B2R/B2M/B2SBR/B2NFD requires --parent-b1-config, --similarity-cache and --center-cache")
         if not args.paired_stage_seeds or args.force_recompute:
@@ -285,13 +310,13 @@ def main():
         "validation_per_class": args.val_per_class,
         "git_commit": args.git_commit,
     }
-    if args.variant in ("b1", "b2", "b2r", "b2m", "b2sbr", "b2nfd", "b3npa"):
+    if args.variant in ("b1", "b2", "b2r", "b2m", "b2sbr", "b2nfd", "b3npa", "b3fcd"):
         from utils.reliable_relation import relation_config
         run_config["variant"] = args.variant
         run_config["relation"] = relation_config(args)
     if args.paired_stage_seeds:
         run_config["paired_stage_seeds"] = True
-    if args.variant in ("b1", "b2", "b2r", "b2m", "b2sbr", "b2nfd", "b3npa") or args.paired_stage_seeds:
+    if args.variant in ("b1", "b2", "b2r", "b2m", "b2sbr", "b2nfd", "b3npa", "b3fcd") or args.paired_stage_seeds:
         run_config.update({
             "source_sha256": args.source_sha256,
             "batch_size": args.batch_size,
@@ -305,21 +330,25 @@ def main():
         })
     nfd = None
     npa = None
+    fcd = None
     if args.skip_query:
         run_config["skip_query"] = True
-    if args.variant in ("b2", "b2r", "b2m", "b2sbr", "b2nfd", "b3npa"):
+    if args.variant in ("b2", "b2r", "b2m", "b2sbr", "b2nfd", "b3npa", "b3fcd"):
         from utils.frozen_b1 import load_frozen_b1
         similarity, centers = load_frozen_b1(args)
-        if args.variant in ("b2nfd", "b3npa"):
+        if args.variant in ("b2nfd", "b3npa", "b3fcd"):
             from utils.neighbor_feature_distill import load_nfd
             nfd = load_nfd(args)
         if args.variant == "b3npa":
             from utils.neighborhood_protected_augmentation import prepare_npa
             npa = prepare_npa(args, nfd, relation_loader, train_loader)
+        if args.variant == "b3fcd":
+            from utils.foundation_distill import load_fcd
+            fcd = load_fcd(args, centers, similarity, train_loader.dataset)
         run_config.update({key: value for key, value in vars(args).items()
                            if key.startswith("parent_")
-                           or key.startswith({"b2": "comp_", "b2r": "i2r_", "b2m": "mix_", "b2sbr": "rank_", "b2nfd": "nfd_", "b3npa": "npa_"}[args.variant])
-                           or (args.variant == "b3npa" and key.startswith("nfd_"))})
+                           or key.startswith({"b2": "comp_", "b2r": "i2r_", "b2m": "mix_", "b2sbr": "rank_", "b2nfd": "nfd_", "b3npa": "npa_", "b3fcd": "fcd_"}[args.variant])
+                           or (args.variant in ("b3npa", "b3fcd") and key.startswith("nfd_"))})
         run_config.update({
             "center_content_sha256": args.center_content_sha256,
             "similarity_content_sha256": args.similarity_content_sha256,
@@ -330,7 +359,7 @@ def main():
         "runs",
         f"{args.dataset}_{args.variant.upper()}_{args.code_length}bit_seed{args.seed}_{args.run_id}",
     )
-    if args.variant in ("b2", "b2r", "b2m", "b2sbr", "b2nfd", "b3npa") and os.path.exists(args.run_dir):
+    if args.variant in ("b2", "b2r", "b2m", "b2sbr", "b2nfd", "b3npa", "b3fcd") and os.path.exists(args.run_dir):
         raise FileExistsError(f"Run already exists; choose a new --output-dir: {args.run_dir}")
     if args.variant == "b2sbr":
         print("SBR configuration=" + json.dumps({
@@ -352,7 +381,7 @@ def main():
                    os.path.join(args.run_dir, "nfd_projection.pt"))
         print("NFD configuration=" + json.dumps(nfd.identity))
 
-    if args.variant not in ("b2", "b2r", "b2m", "b2sbr", "b2nfd", "b3npa"):
+    if args.variant not in ("b2", "b2r", "b2m", "b2sbr", "b2nfd", "b3npa", "b3fcd"):
         similarity = GenerateSimilarityMatrix(
             args, train_loader, relation_loader, val_loader
         )
@@ -360,7 +389,7 @@ def main():
     if args.stage == "similarity":
         return
 
-    if args.variant not in ("b2", "b2r", "b2m", "b2sbr", "b2nfd", "b3npa"):
+    if args.variant not in ("b2", "b2r", "b2m", "b2sbr", "b2nfd", "b3npa", "b3fcd"):
         centers = GenerateSemanticHashCenters(args, similarity.to(args.device))
     from utils.reliable_relation import tensor_sha256
     args.center_content_sha256 = tensor_sha256(centers)
@@ -379,9 +408,10 @@ def main():
         query_loader,
         database_loader,
         num_database,
-        similarity=similarity if args.variant in ("b2", "b2r", "b2m", "b2sbr", "b2nfd", "b3npa") else None,
+        similarity=similarity if args.variant in ("b2", "b2r", "b2m", "b2sbr", "b2nfd", "b3npa", "b3fcd") else None,
         nfd=nfd,
         npa=npa,
+        fcd=fcd,
     )
 
 
