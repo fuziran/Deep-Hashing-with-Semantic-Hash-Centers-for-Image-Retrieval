@@ -85,6 +85,15 @@ def _split_sha256(*index_arrays):
     return digest.hexdigest()
 
 
+def _dataset_sha256(images, labels):
+    """Fingerprint actual pixels and labels, independently of the storage path."""
+    digest = hashlib.sha256()
+    for start in range(0, len(images), 1024):
+        digest.update(np.ascontiguousarray(images[start:start + 1024]).tobytes())
+    digest.update(np.asarray(labels, dtype="<i8").tobytes())
+    return digest.hexdigest()
+
+
 def _save_split_manifest(args, labels, train_idx, val_idx, query_idx, database_idx):
     split_dir = os.path.join(args.output_dir, "splits")
     os.makedirs(split_dir, exist_ok=True)
@@ -150,6 +159,7 @@ def load_data(args):
         )
 
     images, labels = _load_cifar100_raw(args.root)
+    args.dataset_content_sha256 = _dataset_sha256(images, labels)
     train_idx, val_idx, query_idx, database_idx = _stratified_split_cifar100(
         labels, seed=args.seed, val_per_class=args.val_per_class
     )

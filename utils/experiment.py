@@ -27,6 +27,28 @@ def stable_config_hash(config, length=12):
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:length]
 
 
+def file_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def selection_receipt(run_dir):
+    """Bind final selection to its model, manifest and complete training history."""
+    files = {
+        "checkpoint_sha256": "best_model_state.pt",
+        "training_config_sha256": "config.json",
+        "training_history_sha256": "training_history.json",
+    }
+    return {"selection_receipt_version": 1, **{
+        key: file_sha256(os.path.join(run_dir, name))
+        if os.path.isfile(os.path.join(run_dir, name)) else None
+        for key, name in files.items()
+    }}
+
+
 def current_git_commit():
     try:
         return subprocess.check_output(

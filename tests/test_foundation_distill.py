@@ -30,7 +30,8 @@ def dataset_fixture():
 
 
 def cache_fixture(path,args,dataset,passed=True):
-    ids=torch.tensor(np.sort(dataset.indices));labels=torch.tensor(dataset.labels[ids])
+    ids=torch.tensor(np.sort(dataset.indices),dtype=torch.long)
+    labels=torch.tensor(dataset.labels[ids],dtype=torch.long)
     logits=F.one_hot(labels,args.num_classes).float()*4
     identity=dict(version=CACHE_VERSION,dataset=args.dataset,seed=args.seed,split_hash=args.split_hash,
                   num_classes=args.num_classes,classifier_sha256=args.classifier_sha256,
@@ -139,6 +140,10 @@ class TrainingTests(unittest.TestCase):
             train_val(args,H,loader,val,object(),None,12,S,nfd=nfd,fcd=fcd)
         self.assertEqual(nets[0].calls,12);self.assertEqual(nets[0].bn.num_batches_tracked.item(),12)
         self.assertFalse(json.loads((path/'metrics.json').read_text())['query_evaluated'])
+        from utils.experiment import selection_receipt
+        summary=json.loads((path/'metrics.json').read_text())
+        for key,value in selection_receipt(path).items():
+            self.assertEqual(summary[key],value)
         self.assertFalse(any('teacher_logits' in k or 'head.' in k for k in nets[0].state_dict()))
         return json.loads((path/'training_history.json').read_text()),nets[0].state_dict()
 
@@ -185,6 +190,15 @@ class EntryTests(unittest.TestCase):
 
 
 class PreparationTests(unittest.TestCase):
+    def test_dinov3_requires_new_runtime_before_model_loading(self):
+        from scripts import prepare_foundation_teacher as prepare
+        argv=['prepare','--nfd-config','unused.json','--foundation-repo','unused',
+              '--foundation-weights','unused.pt','--output-dir','unused-output']
+        with patch('sys.argv',argv),patch('torch.__version__','2.1.2'), \
+             patch('torch.hub.load') as hub,patch('sys.stderr'),self.assertRaises(SystemExit):
+            prepare.main()
+        hub.assert_not_called()
+
     def test_frozen_extraction_classifier_probe_and_gate(self):
         from scripts.prepare_foundation_teacher import extract,fit_classifier,fit_hash_probe,retrieval_metrics,teacher_check
         data=dataset_fixture();loader=DataLoader(data,batch_size=3)
@@ -230,7 +244,10 @@ class PreparationTests(unittest.TestCase):
             argv=['prepare','--nfd-config',str(config),'--foundation-repo',str(repo),
                   '--foundation-weights',str(weights),'--output-dir',str(output),'--probe-steps','2','--cpu']
             # The information-gate formula has its own independent test above.
-            with patch('sys.argv',argv),patch('torch.hub.load',return_value=foundation) as hub, \
+            # Mocked backbone: exercise preparation logic in the original SHC
+            # environment too, while testing the real DINOv3 version gate separately.
+            with patch('sys.argv',argv),patch('torch.__version__','2.7.1'), \
+                 patch('torch.hub.load',return_value=foundation) as hub, \
                  patch('data.data_loader.load_data',side_effect=load_data), \
                  patch('utils.frozen_b1.load_frozen_b1',return_value=(S,H.repeat(1,8))), \
                  patch('utils.neighbor_feature_distill.load_nfd',return_value=argparse.Namespace(teacher=Old())), \

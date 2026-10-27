@@ -5,6 +5,10 @@ Entry: `run.py --variant b3fcd`. This is an experimental candidate; no retrieval
 gain is claimed. The previous NPA implementation remains available for historical
 reproduction and is not activated by FCD.
 
+For the current 32-bit CE/plain/neighbor screen and independent query evaluation,
+use the complete workflow at the end of this file. The historical three-code
+command below is an optional later experiment, not the initial screen.
+
 ## Implementation
 
 Keep the audited I1 relation, centers, old classifier and NFD unchanged. Train a
@@ -253,7 +257,7 @@ Full optimizer/RNG resume is not implemented for this NFD-based variant. A best
 student checkpoint is not an exact resume checkpoint. `nohup` protects against
 terminal hangup, not process/machine failure.
 
-Local CPU verification passes 98 tests (PyTorch 2.14.0+cpu), including independent
+The original FCD CPU verification passed 98 tests (PyTorch 2.14.0+cpu), including independent
 DKD formula checks, extreme logits, teacher detachment, label/ID/image corruption,
 exact disabled reduction, single forward/BN update, real audited parent dispatch,
 synthetic full offline preparation and three-run launcher/summary. No official
@@ -262,3 +266,148 @@ compatibility, teacher superiority and retrieval improvement remain remote check
 
 References: DINOv3 https://arxiv.org/abs/2508.10104 ; DKD (CVPR 2022)
 https://openaccess.thecvf.com/content/CVPR2022/html/Zhao_Decoupled_Knowledge_Distillation_CVPR_2022_paper.html .
+
+## 32bit 三组筛选与独立 query 评估
+
+本次新增 `scripts/evaluate_query.py` 与 `scripts/run_i3_fcd_screen.sh`。
+筛选脚本按测试、教师准备及信息检查、三组参数检查、ce/plain/neighbor顺序训练执行。
+任何步骤失败立即停止；三组均不传 `--evaluate-query`，不自动运行最终查询评价。
+三个学生各自继承原 NFD 的300轮预算、初始化、数据顺序和 NFD 参数。
+本地修改必须先同步到服务器，再开始新训练。
+
+### 同步本地修改
+
+在本地 PowerShell 执行。只暂存本次代码与文档，避免加入已有数据、输出与研究报告：
+
+```powershell
+Set-Location D:\SHC\SHC-Baseline-run
+git add -- .gitattributes network.py train.py data/data_loader.py utils/experiment.py scripts/evaluate_query.py scripts/run_i3_fcd_screen.sh tests/test_query_evaluation.py tests/test_foundation_distill.py FCD_README.md
+git diff --cached --stat
+git commit -m "Add audited standalone query evaluation and FCD screen workflow"
+git push -u origin update-reliable-relation-nfd-distillation-i3-foundation-discriminative-distillation
+```
+
+以下命令在远程 Linux/WSL Bash 中依次执行：
+
+```bash
+cd /mnt/d/fzr/SHC
+git fetch origin
+git switch update-reliable-relation-nfd-distillation-i3-foundation-discriminative-distillation
+git pull --ff-only
+git log -1 --oneline
+
+NFD32='./save_nfd_seed60_bINBuclZ/nfd/runs/cifar-100-new-seg_B2NFD_32bit_seed60_639b7ea1eaa3/config.json'
+test -f "$NFD32"
+```
+
+### 教师环境与官方权重
+
+原 SHC 环境不升级。若已存在 `SHC_FCD_teacher`，跳过创建；否则：
+
+```bash
+conda create -n SHC_FCD_teacher python=3.11 -y
+conda run -n SHC_FCD_teacher python -m pip install torch==2.7.1 torchvision==0.22.1 --index-url https://download.pytorch.org/whl/cu118
+conda run -n SHC_FCD_teacher python -m pip install 'numpy<2' pillow scipy matplotlib
+```
+
+官方 DINOv3 PyTorch Hub 列出的依赖为 torch、numpy；本项目准备流程还使用上面的图像及科学计算库。
+模型须为 **DINOv3 ViT-B/16 LVD-1689M**，下载权限与对应URL由官方流程提供：
+https://github.com/facebookresearch/dinov3 。不提供猜测的权重下载地址。
+
+```bash
+mkdir -p external models_ckpt logs
+if [ ! -d external/dinov3 ]; then
+  git clone https://github.com/facebookresearch/dinov3.git external/dinov3
+fi
+if [ ! -s models_ckpt/dinov3_vitb16.pth ]; then
+  read -r -s -p '粘贴官方 ViT-B/16 LVD-1689M 权重下载URL: ' DINO_URL
+  printf '\n'
+  wget -q -O models_ckpt/dinov3_vitb16.pth "$DINO_URL"
+  unset DINO_URL
+fi
+test -s models_ckpt/dinov3_vitb16.pth
+conda run -n SHC_FCD_teacher python -c 'import torch,torchvision; print(torch.__version__,torchvision.__version__); assert torch.cuda.is_available(), "Teacher CUDA unavailable"'
+conda run -n SHC python -c 'import torch,torchvision; print(torch.__version__,torchvision.__version__); assert torch.cuda.is_available(), "SHC CUDA unavailable"'
+```
+
+### 后台执行完整32bit流程
+
+本段不需要手动切换 Conda 环境；脚本使用 `conda run` 调用两个现有环境。
+若原训练环境不叫 SHC，将 `SHC_TRAIN_ENV=SHC` 改成实际环境名。
+目录记录在日志目录的 `.output_path` 文件中，换终端后可以读取。
+
+```bash
+SCREEN_STAMP=$(date +%Y%m%d_%H%M%S)
+SCREEN_ROOT="$(pwd)/save/i3_fcd_screen32_seed60_${SCREEN_STAMP}"
+SCREEN_LOG="$(pwd)/logs/i3_fcd_screen32_seed60_${SCREEN_STAMP}.log"
+printf '%s\n' "$SCREEN_ROOT" > "${SCREEN_LOG}.output_path"
+
+nohup env SHC_TRAIN_ENV=SHC SHC_TEACHER_ENV=SHC_FCD_teacher SHC_GPU=0 \
+  bash scripts/run_i3_fcd_screen.sh \
+  "$NFD32" ./external/dinov3 ./models_ckpt/dinov3_vitb16.pth "$SCREEN_ROOT" \
+  > "$SCREEN_LOG" 2>&1 &
+printf 'PID=%s\nLOG=%s\nOUTPUT=%s\n' "$!" "$SCREEN_LOG" "$SCREEN_ROOT"
+```
+
+脚本包含以下实际教师准备参数：extraction batch=32，probe steps=200，GPU=0。
+教师检查要求 `passed=true`，缓存位于 `SCREEN_ROOT/teacher/foundation_cache.pt`。
+若提取显存不足，在新的输出根目录重试，并设置 `SHC_EXTRACTION_BATCH=16`；不修改学生训练batch。
+FCD三组固定 weight=0.05、temperature=2、gamma=1、topk=5、warmup=40、ramp-end=60。
+教师只做一次准备，随后三组顺序复用同一缓存。
+
+```bash
+tail -f "$SCREEN_LOG"
+# 教师结束后：
+cat "$SCREEN_ROOT/teacher/teacher_report.json"
+# 进入相应训练后：
+tail -f "$SCREEN_ROOT/ce/32bit.log"
+tail -f "$SCREEN_ROOT/plain/32bit.log"
+tail -f "$SCREEN_ROOT/neighbor/32bit.log"
+# 全部完成后：
+cat "$SCREEN_ROOT/validation_comparison.csv"
+```
+
+`validation_comparison.csv` 包含原 NFD 与三组新方法的选中轮次、验证ALL、@100、@1000。
+每组的三项指标均取自按验证ALL选中的同一轮，不能逐项挑最高值。
+若教师检查失败，查看 teacher.log/report；若测试失败，查看 tests.log；训练失败查看相应32bit.log。
+输出根目录不复用，且当前仍不支持完整训练断点恢复。
+
+### 单独评价已完成训练的最佳模型
+
+以下是后续显式评价入口，**不属于上面的筛选脚本**。只在决定评价冻结模型时执行。
+脚本不接受其他epoch、任意checkpoint或跳过摘要检查的选项。
+支持本次更新后完成、带校验记录的 paired NFD/FCD；历史运行没有这些记录时，保留原评价流程，不能补写伪造的训练校验记录。
+
+新训练的 metrics.json 保存最佳模型、训练配置、完整训练历史的 SHA256。
+数据加载阶段记录完整像素与标签摘要。评价会严格核对这些记录、训练源码、按验证ALL首次最大值选中的轮次、数据内容和划分摘要；模型通过 strict=True 完整加载，构造时不下载预训练权重。
+不需要 DINO权重、教师缓存、中心缓存或辅助分类头，不运行优化器，也不遍历训练/验证loader。
+默认结果目录为该run下新建的 `final_query/`；已存在时拒绝覆盖。
+原训练 config/metrics/history/model 保持不变。
+
+```bash
+# SCREEN_ROOT 指向上面那次已完成的筛选输出。
+# 先检查三组；dry-run检查模型和数据，不进行query前向：
+for mode in ce plain neighbor; do
+  RUN_DIR=$(conda run -n SHC python -c \
+    'import csv,sys; r=list(csv.DictReader(open(sys.argv[1]))); assert len(r)==1; print(r[0]["run_dir"])' \
+    "$SCREEN_ROOT/$mode/summary.csv")
+  conda run --no-capture-output -n SHC python scripts/evaluate_query.py \
+    --run-dir "$RUN_DIR" --gpu 0 --dry-run || break
+done
+
+# 明确决定评价三组冻结模型后再执行；不重训：
+for mode in ce plain neighbor; do
+  RUN_DIR=$(conda run -n SHC python -c \
+    'import csv,sys; r=list(csv.DictReader(open(sys.argv[1]))); assert len(r)==1; print(r[0]["run_dir"])' \
+    "$SCREEN_ROOT/$mode/summary.csv")
+  conda run --no-capture-output -n SHC python -u scripts/evaluate_query.py \
+    --run-dir "$RUN_DIR" --gpu 0 || break
+done
+```
+
+如数据仅迁移位置，可增加 `--data-root /实际/cifar-100-python`；内容必须完全一致。
+`final_query/metrics.json` 记录三个query指标及来源校验，`retrieval_outputs.pt` 保存query/database二值码、标签、显式样本ID、每query AP及PR数据，并保存本次划分副本。
+最终成功以新评价目录中完整的 metrics.json 为准，原训练 metrics.json 的 query_evaluated=false 不回写。
+新流程本地合成验证通过不等同真实DINO权重、CUDA或CIFAR-100指标验证。
+本次新增8项独立评价及数据摘要测试，以及独立DINOv3环境版本门槛测试；合成教师准备测试隔离了真实DINOv3运行时要求，避免要求原SHC环境升级。
+107项完整CPU回归在PyTorch 2.2.2 / torchvision 0.17.2通过；PyTorch 2.14.0 CPU也完成完整回归及最终FCD测试复核。启动脚本通过Bash语法检查，以及正常顺序、教师失败停止、plain训练失败停止三种模拟流程检查。

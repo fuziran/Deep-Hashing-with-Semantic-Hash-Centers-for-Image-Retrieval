@@ -54,9 +54,11 @@ def _build_resnet(res_model="ResNet34"):
 
 
 class ResNet(nn.Module):
-    def __init__(self, hash_bit, res_model="ResNet34"):
+    def __init__(self, hash_bit, res_model="ResNet34", pretrained=True):
         super(ResNet, self).__init__()
-        model_resnet = _build_resnet(res_model)
+        # Evaluation strictly loads a complete checkpoint and needs no pretrained weights.
+        model_resnet = (_build_resnet(res_model) if pretrained
+                        else resnet_dict[res_model](weights=None))
 
         self.conv1 = model_resnet.conv1
         self.bn1 = model_resnet.bn1

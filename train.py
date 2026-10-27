@@ -442,8 +442,11 @@ def train_val(
     torch.save(best_state, os.path.join(args.run_dir, "best_model_state.pt"))
     with open(os.path.join(args.run_dir, "training_history.json"), "w", encoding="utf-8") as f:
         json.dump(history, f, ensure_ascii=False, indent=2)
+    from utils.experiment import selection_receipt
+    receipt = selection_receipt(args.run_dir)
     if getattr(args, "skip_query", False):
         summary = {
+            **receipt,
             "selected_epoch": best_epoch,
             "selection_metric": "validation mAP@ALL",
             "best_validation_mAP@ALL": best_validation_map,
@@ -468,6 +471,7 @@ def train_val(
         args.topK,
     )
     summary = {
+        **receipt,
         "selected_epoch": best_epoch,
         "selection_metric": "validation mAP@ALL",
         "best_validation_mAP@ALL": best_validation_map,
@@ -476,7 +480,6 @@ def train_val(
     }
 
     os.makedirs(args.run_dir, exist_ok=True)
-    torch.save(best_state, os.path.join(args.run_dir, "best_model_state.pt"))
     torch.save(
         {
             "query_binary": query_binary,
@@ -488,8 +491,6 @@ def train_val(
         },
         os.path.join(args.run_dir, "retrieval_outputs.pt"),
     )
-    with open(os.path.join(args.run_dir, "training_history.json"), "w", encoding="utf-8") as f:
-        json.dump(history, f, ensure_ascii=False, indent=2)
     with open(os.path.join(args.run_dir, "metrics.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
     _save_curves(args.run_dir, losses, learning_rates)
