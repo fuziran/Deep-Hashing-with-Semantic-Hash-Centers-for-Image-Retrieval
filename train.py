@@ -444,9 +444,15 @@ def train_val(
         json.dump(history, f, ensure_ascii=False, indent=2)
     from utils.experiment import selection_receipt
     receipt = selection_receipt(args.run_dir)
+    fcd_provenance = ({"fcd_exploratory": bool(getattr(args, "fcd_exploratory", False)),
+                       "fcd_original_teacher_check_passed": getattr(
+                           args, "fcd_original_teacher_check_passed", None),
+                       "fcd_diagnostic_sha256": getattr(args, "fcd_diagnostic_sha256", None)}
+                      if getattr(args, "variant", "b0") == "b3fcd" else {})
     if getattr(args, "skip_query", False):
         summary = {
             **receipt,
+            **fcd_provenance,
             "selected_epoch": best_epoch,
             "selection_metric": "validation mAP@ALL",
             "best_validation_mAP@ALL": best_validation_map,
@@ -472,6 +478,7 @@ def train_val(
     )
     summary = {
         **receipt,
+        **fcd_provenance,
         "selected_epoch": best_epoch,
         "selection_metric": "validation mAP@ALL",
         "best_validation_mAP@ALL": best_validation_map,

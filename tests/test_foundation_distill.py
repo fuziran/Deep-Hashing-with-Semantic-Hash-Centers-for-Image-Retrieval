@@ -17,7 +17,7 @@ from tests.test_b2nfd_feature_distill import S,P,H,TinyNet,Teacher,CacheTeacher
 from tests import test_b2nfd_feature_distill as nfd_tests
 from utils.neighbor_feature_distill import NeighborhoodFeatureDistillation
 from utils.foundation_distill import (FoundationDistillation,decoupled_loss,ramp,load_fcd,
-                                      CACHE_VERSION,image_subset_sha256)
+                                      CACHE_VERSION,image_subset_sha256,file_sha256)
 from utils.reliable_relation import tensor_sha256
 
 
@@ -40,6 +40,19 @@ def cache_fixture(path,args,dataset,passed=True):
     for name,value in [('ids',ids),('labels',labels),('logits',logits)]: identity[name+'_sha256']=tensor_sha256(value)
     payload=dict(identity=identity,ids=ids,labels=labels,logits=logits,teacher_check=dict(passed=passed))
     torch.save(payload,path);return payload
+
+
+def diagnostic_fixture(path,cache_path,payload,reference=None):
+    value=dict(teacher_dir=str(cache_path.parent.resolve()),teacher_check_passed=False,
+               foundation_weights_sha256=payload['identity']['foundation_weights_sha256'],
+               diagnostic_source_sha256=file_sha256(Path(__file__).resolve().parents[1]
+                                                    /'scripts'/'diagnose_fcd_logits.py'),
+               counts={'train':len(payload['ids']),'validation':3},
+               nfd_config=str(reference.resolve()) if reference else 'synthetic',
+               soft_center_T2={name:dict(new=.9,old=.8,delta=.1,paired_bootstrap_95=[.05,.15])
+                               for name in ('mAP@ALL','mAP@100','mAP@1000')})
+    path.write_text(json.dumps(value),encoding='utf-8')
+    return value
 
 
 class FormulaTests(unittest.TestCase):
@@ -115,6 +128,24 @@ class CacheTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError,'images'):load_fcd(args,H,S,data)
             args.fcd_weight=0
             self.assertIsNone(load_fcd(args,None,None,None))
+
+    def test_failed_gate_allows_only_explicit_positive_exploratory_diagnostic(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder);path=root/'cache.pt';data=dataset_fixture();args=self.args(path)
+            payload=cache_fixture(path,args,data,False)
+            diagnostic=root/'diagnostic.json'
+            value=diagnostic_fixture(diagnostic,path,payload)
+            with self.assertRaisesRegex(ValueError,'information check'):
+                load_fcd(args,H,S,data)
+            args.fcd_exploratory_diagnostic=str(diagnostic)
+            self.assertIsNotNone(load_fcd(args,H,S,data))
+            self.assertTrue(args.fcd_exploratory)
+            self.assertFalse(args.fcd_original_teacher_check_passed)
+            self.assertEqual(args.fcd_diagnostic_sha256,file_sha256(diagnostic))
+            value['soft_center_T2']['mAP@ALL']['paired_bootstrap_95'][0]=-.01
+            diagnostic.write_text(json.dumps(value),encoding='utf-8')
+            with self.assertRaisesRegex(ValueError,'positive mAP@ALL'):
+                load_fcd(args,H,S,data)
 
 
 class TrainingTests(unittest.TestCase):
@@ -289,6 +320,19 @@ class LauncherTests(unittest.TestCase):
             self.assertEqual([r['bits'] for r in rows],['16','32','64'])
             torch.save({'teacher_check':{'passed':False}},cache)
             with patch('sys.argv',argv+['--output-root',str(root/'failed')]),patch('sys.stderr'),self.assertRaises(SystemExit):
+                launch.main()
+
+            args=CacheTests().args(cache)
+            payload=cache_fixture(cache,args,dataset_fixture(),False)
+            diagnostic=root/'diagnostic.json'
+            diagnostic_fixture(diagnostic,cache,payload,paths[1])
+            pilot=['launch','--teacher-cache',str(cache),'--nfd-config',str(paths[1]),
+                   '--bits','32','--output-root',str(root/'pilot'),
+                   '--exploratory-diagnostic',str(diagnostic),'--dry-run']
+            with patch('sys.argv',pilot),patch('subprocess.run') as process,patch('builtins.print'):
+                launch.main()
+            process.assert_not_called()
+            with patch('sys.argv',pilot+['--evaluate-query']),patch('sys.stderr'),self.assertRaises(SystemExit):
                 launch.main()
 
 

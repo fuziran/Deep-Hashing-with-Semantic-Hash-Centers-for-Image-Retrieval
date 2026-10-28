@@ -133,6 +133,8 @@ def load_config():
     parser.add_argument("--fcd-topk", type=int, default=5)
     parser.add_argument("--fcd-warmup", type=int, default=40)
     parser.add_argument("--fcd-ramp-end", type=int, default=60)
+    parser.add_argument("--fcd-exploratory-diagnostic", default=None,
+                        help="Audited direct-logit report for a validation-only pilot after the original teacher gate failed.")
     args = parser.parse_args()
     if args.variant == "b3fcd":
         from utils.foundation_distill import VERSION, ramp
@@ -146,11 +148,13 @@ def load_config():
                 raise ValueError("FCD topk must be smaller than num-classes")
             if args.fcd_weight > 0 and (not args.fcd_cache or args.epoch < args.fcd_ramp_end):
                 raise ValueError("Enabled FCD requires --fcd-cache and epoch budget covering ramp")
+            if args.fcd_exploratory_diagnostic and (args.fcd_weight == 0 or not args.skip_query):
+                raise ValueError("Exploratory FCD requires positive weight and --skip-query")
         except ValueError as error:
             parser.error(str(error))
         args.fcd_version=VERSION
-    elif args.fcd_cache:
-        parser.error("--fcd-cache requires --variant b3fcd")
+    elif args.fcd_cache or args.fcd_exploratory_diagnostic:
+        parser.error("FCD cache/diagnostic requires --variant b3fcd")
     if args.variant == "b3npa":
         from utils.neighborhood_protected_augmentation import VERSION, npa_weight
         try:

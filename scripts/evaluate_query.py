@@ -112,7 +112,11 @@ def evaluate(options):
         report = dict(
             run_dir=str(run_dir), run_id=config["run_id"], variant=config["variant"],
             code_length=config["code_length"], seed=config["seed"],
-            fcd_mode=config.get("fcd_mode"), selected_epoch=training["selected_epoch"],
+            fcd_mode=config.get("fcd_mode"),
+            fcd_exploratory=config.get("fcd_exploratory", False),
+            fcd_original_teacher_check_passed=config.get("fcd_original_teacher_check_passed"),
+            fcd_diagnostic_sha256=config.get("fcd_diagnostic_sha256"),
+            selected_epoch=training["selected_epoch"],
             selection_metric=training["selection_metric"], selected_validation=validation,
             split_hash=args.split_hash, dataset_content_sha256=args.dataset_content_sha256,
             training_source_sha256=config["source_sha256"],

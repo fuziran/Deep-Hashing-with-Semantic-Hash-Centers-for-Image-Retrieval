@@ -32,6 +32,8 @@ def build_command(path,config,options):
               '--fcd-temperature',str(options.temperature),'--fcd-gamma',str(options.gamma),
               '--fcd-topk',str(options.topk),'--fcd-warmup',str(options.warmup),'--fcd-ramp-end',str(options.ramp_end)]
     if options.weight>0: command+=['--fcd-cache',str(Path(options.teacher_cache).resolve())]
+    if options.exploratory_diagnostic:
+        command+=['--fcd-exploratory-diagnostic',str(Path(options.exploratory_diagnostic).resolve())]
     if config['non_deterministic']: command+=['--non-deterministic']
     if not options.evaluate_query: command+=['--skip-query']
     if options.weight>0 and config['epoch']<options.ramp_end: raise ValueError('Training budget does not cover FCD ramp')
@@ -56,6 +58,7 @@ def main():
     parser.add_argument('--warmup',type=int,default=40)
     parser.add_argument('--ramp-end',type=int,default=60)
     parser.add_argument('--evaluate-query',action='store_true')
+    parser.add_argument('--exploratory-diagnostic',help='Direct-logit report for a validation-only pilot after the original teacher gate failed')
     parser.add_argument('--dry-run',action='store_true')
     options=parser.parse_args()
     if (not options.bits or len(set(options.bits))!=len(options.bits) or any(b not in (16,32,64) for b in options.bits)
@@ -69,9 +72,23 @@ def main():
         if not options.teacher_cache or not Path(options.teacher_cache).is_file():
             parser.error('Prepare a foundation_cache.pt first using prepare_foundation_teacher.py')
         import torch
+        from utils.foundation_distill import validate_exploratory_diagnostic
         cache=torch.load(options.teacher_cache,map_location='cpu',weights_only=False)
         if cache.get('teacher_check',{}).get('passed') is not True:
-            parser.error('Teacher information check failed; inspect teacher_report.json')
+            if not options.exploratory_diagnostic:
+                parser.error('Teacher information check failed; inspect teacher_report.json')
+            if options.evaluate_query:
+                parser.error('Exploratory pilot is validation-only; omit --evaluate-query')
+            try:
+                for reference in options.nfd_config:
+                    validate_exploratory_diagnostic(options.teacher_cache,cache,
+                                                    options.exploratory_diagnostic,reference)
+            except (OSError,ValueError,KeyError,TypeError) as error:
+                parser.error(str(error))
+        elif options.exploratory_diagnostic:
+            parser.error('Exploratory diagnostic is only for a failed original teacher gate')
+    elif options.exploratory_diagnostic:
+        parser.error('Exploratory diagnostic requires a positive FCD weight')
     try:
         selected=select_configs('.',options.nfd_config,options.bits,options.dataset,options.seed)
         plan=[]
@@ -96,6 +113,7 @@ def main():
         metrics=read_config(runs[0]/'metrics.json')
         record=dict(bits=row['bits'],run_dir=str(runs[0]),selected_epoch=metrics['selected_epoch'],
                     query_evaluated=metrics['query_evaluated'],
+                    fcd_exploratory=metrics.get('fcd_exploratory',False),
                     best_validation_mAP_ALL=metrics['best_validation_mAP@ALL'])
         record.update({key:(metrics.get('query_metrics') or {}).get(key) for key in ('mAP@ALL','mAP@100','mAP@1000')})
         results.append(record)

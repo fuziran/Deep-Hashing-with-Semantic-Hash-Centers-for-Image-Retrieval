@@ -39,6 +39,35 @@ def ramp(epoch, maximum=.05, warmup=40, end=60):
     return maximum * min(1., max(0., (epoch-warmup)/(end-warmup)))
 
 
+def validate_exploratory_diagnostic(cache_path, payload, diagnostic_path, nfd_config=None):
+    """Validate independent logit evidence without changing the failed gate."""
+    import json
+    path = Path(diagnostic_path).resolve()
+    report = json.loads(path.read_text(encoding='utf-8'))
+    identity = payload['identity']
+    if (payload.get('teacher_check', {}).get('passed') is not False
+            or report.get('teacher_check_passed') is not False
+            or Path(report.get('teacher_dir', '')).resolve() != Path(cache_path).resolve().parent
+            or report.get('foundation_weights_sha256') != identity['foundation_weights_sha256']
+            or report.get('counts', {}).get('train') != len(payload['ids'])):
+        raise ValueError('Exploratory diagnostic does not match the failed teacher cache')
+    if nfd_config is not None and Path(report.get('nfd_config', '')).resolve() != Path(nfd_config).resolve():
+        raise ValueError('Exploratory diagnostic does not match the NFD reference')
+    if report.get('diagnostic_source_sha256') != file_sha256(
+            Path(__file__).resolve().parents[1] / 'scripts' / 'diagnose_fcd_logits.py'):
+        raise ValueError('Exploratory diagnostic source differs from the current checkout')
+    scores = report.get('soft_center_T2', {})
+    for metric in ('mAP@ALL', 'mAP@100', 'mAP@1000'):
+        item = scores.get(metric, {})
+        lower, upper = item.get('paired_bootstrap_95', (None, None))
+        values = (item.get('new'), item.get('old'), item.get('delta'), lower, upper)
+        if (not all(isinstance(value, (int, float)) and math.isfinite(value) for value in values)
+                or abs(values[0] - values[1] - values[2]) > 1e-6
+                or values[2] <= 0 or lower <= 0 or upper < lower):
+            raise ValueError(f'Exploratory direct-logit diagnostic lacks positive {metric} evidence')
+    return file_sha256(path)
+
+
 def decoupled_loss(student, teacher, targets, temperature=2., weights=None):
     """Stable TCKD + NCKD; optional equal-policy non-target reweighting.
 
@@ -146,8 +175,19 @@ def load_fcd(args, centers, similarity, train_dataset):
         raise ValueError('Foundation cache training IDs differ')
     if not np.array_equal(payload['labels'].numpy(),np.asarray(train_dataset.labels)[payload['ids'].numpy()]):
         raise ValueError('Foundation cache labels differ')
-    if payload.get('teacher_check',{}).get('passed') is not True:
-        raise ValueError('Foundation teacher failed or lacks validation-only information check; inspect teacher_report.json')
+    passed = payload.get('teacher_check',{}).get('passed') is True
+    diagnostic = getattr(args, 'fcd_exploratory_diagnostic', None)
+    if not passed:
+        if not diagnostic:
+            raise ValueError('Foundation teacher failed or lacks validation-only information check; inspect teacher_report.json')
+        args.fcd_diagnostic_sha256 = validate_exploratory_diagnostic(args.fcd_cache,payload,diagnostic)
+        args.fcd_exploratory = True
+        args.fcd_original_teacher_check_passed = False
+    elif diagnostic:
+        raise ValueError('Exploratory diagnostic is only for a teacher with a failed original gate')
+    else:
+        args.fcd_exploratory = False
+        args.fcd_original_teacher_check_passed = True
     if centers.shape != (args.num_classes,args.code_length): centers=centers.T
     module=FoundationDistillation(centers,similarity,payload['ids'],payload['logits'],payload['labels'],
                                   args.fcd_mode,args.fcd_temperature,args.fcd_gamma,args.fcd_topk)
