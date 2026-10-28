@@ -90,6 +90,16 @@ same validation set used for the check, so the check is developmental evidence.
 All outputs are saved even on failure, then preparation exits nonzero and the
 launcher refuses formal runs. Do not bypass the check to claim teacher superiority.
 
+When the fixed hash probe fails despite better classification, run
+`scripts/diagnose_fcd_logits.py` before considering another hash training job.
+It reuses cached DINOv3 training logits and the saved classifier, infers only
+validation DINOv3 features plus the original teacher's train/validation logits,
+then compares hard class-center codes and soft T=2 expected-center codes under
+the same validation-vs-training-only retrieval protocol. The report includes
+paired bootstrap intervals over validation queries. This is exploratory evidence
+about the actual distillation logits; it does not replace the failed fixed-probe
+gate or evaluate the final query/database.
+
 `foundation_cache.pt` contains plain CPU tensors and scalar/dict provenance for
 compatibility with the original SHC environment. Loading verifies split, dataset,
 seed, old classifier digest, preprocessing sizes, exact training IDs/labels, actual
@@ -153,6 +163,7 @@ python -m pip install 'numpy<2' pillow scipy matplotlib
 
 mkdir -p external models_ckpt
 git clone https://github.com/facebookresearch/dinov3.git external/dinov3
+python -m pip install 'numpy<2' -r external/dinov3/requirements.txt --index-url https://pypi.org/simple --timeout 60 --retries 3
 read -r -p 'Paste the official DINOv3 ViT-B/16 LVD-1689M download URL: ' DINO_URL
 wget -O models_ckpt/dinov3_vitb16.pth "$DINO_URL"
 unset DINO_URL
@@ -161,6 +172,8 @@ unset DINO_URL
 If the repository/weight/environment already exists, reuse it rather than recreate
 it. The URL is the one required account-specific input; no public URL is invented
 or embedded. A small access-denied HTML file will fail strict checkpoint loading.
+The local Hub entrypoint imports evaluation modules, so install the official
+requirements.txt even when using only the ViT-B/16 backbone.
 The program records weight SHA256, so the arbitrary local filename is not its
 identity. An explicitly requested DINOv2 control is supported by changing both
 repo/weights and `--foundation-model dinov2_vitb14_reg`; no automatic fallback occurs.
@@ -310,7 +323,7 @@ conda run -n SHC_FCD_teacher python -m pip install torch==2.7.1 torchvision==0.2
 conda run -n SHC_FCD_teacher python -m pip install 'numpy<2' pillow scipy matplotlib
 ```
 
-官方 DINOv3 PyTorch Hub 列出的依赖为 torch、numpy；本项目准备流程还使用上面的图像及科学计算库。
+官方 DINOv3 的 Hub 入口还会导入评估模块，实际需要仓库 requirements.txt 中的依赖（包括 torchmetrics）；只按 Hub 声明的 torch、numpy 安装会在加载时失败。
 模型须为 **DINOv3 ViT-B/16 LVD-1689M**，下载权限与对应URL由官方流程提供：
 https://github.com/facebookresearch/dinov3 。不提供猜测的权重下载地址。
 
@@ -319,6 +332,7 @@ mkdir -p external models_ckpt logs
 if [ ! -d external/dinov3 ]; then
   git clone https://github.com/facebookresearch/dinov3.git external/dinov3
 fi
+conda run -n SHC_FCD_teacher python -m pip install 'numpy<2' -r external/dinov3/requirements.txt --index-url https://pypi.org/simple --timeout 60 --retries 3
 if [ ! -s models_ckpt/dinov3_vitb16.pth ]; then
   read -r -s -p '粘贴官方 ViT-B/16 LVD-1689M 权重下载URL: ' DINO_URL
   printf '\n'
