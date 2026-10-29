@@ -51,7 +51,7 @@ class SemanticMixup:
         if not ((centers == -1) | (centers == 1)).all():
             raise ValueError("Centers must contain only -1/+1")
         validate_similarity(similarity, len(centers))
-        if mode not in ("semantic", "plain"):
+        if mode not in ("semantic", "plain", "uniform_budgeted"):
             raise ValueError("Unknown Mixup mode")
         self.centers = centers.detach().cpu().float().clone()
         self.similarity = similarity.detach().cpu().double().clone()
@@ -116,7 +116,7 @@ class SemanticMixup:
             j = members[c][torch.randint(len(members[c]), (1,), generator=self.generator).item()].item()
             beta0 = torch.rand((), generator=self.generator).item() * .5
             distance = self.distance[anchor, c].item()
-            beta = min(beta0, self.budget / distance) if self.mode == "semantic" else beta0
+            beta = min(beta0, self.budget / distance) if self.mode != "plain" else beta0
             anchors.append(i)
             partners.append(j)
             fractions.append(beta)

@@ -189,7 +189,7 @@ def train_val(
 ):
     print(f"========== start {args.info} network training ==========")
     bit = args.code_length
-    if (getattr(args, "variant", "b0") in ("b2nfd", "b3npa", "b3fcd", "b3rnd", "b3nvc")) != (nfd is not None):
+    if (getattr(args, "variant", "b0") in ("b2nfd", "b3npa", "b3fcd", "b3rnd", "b3nvc", "b3nmix")) != (nfd is not None):
         raise ValueError("NFD variant requires exactly one prepared frozen distiller")
     if npa is not None and getattr(args, "variant", "b0") != "b3npa":
         raise ValueError("NPA requires the b3npa variant")
@@ -214,7 +214,7 @@ def train_val(
         hash_center = hash_center.T
     criterion = CSQLoss(args, bit, hash_center, similarity)
     mixer = None
-    if getattr(args, "variant", "b0") == "b2m":
+    if getattr(args, "variant", "b0") in ("b2m", "b3nmix"):
         if similarity is None:
             raise ValueError("B2M requires the frozen B1 relation matrix")
         mixer = SemanticMixup(hash_center, similarity, args.mix_seed,
@@ -404,11 +404,15 @@ def train_val(
                                     args.mix_warmup, args.mix_ramp_end)
                 mixed_components = backward_mix(net, images, labels.argmax(dim=1),
                                                 mixer, weight, batch_index == 0)
-                gradient_sample = {key: value for key, value in mixed_components.items()
-                                   if key.startswith("sampled_")} or gradient_sample
+                mix_sample = {key: value for key, value in mixed_components.items()
+                              if key.startswith("sampled_")}
+                if nfd is not None:
+                    gradient_sample.update({"mix_" + key: value for key, value in mix_sample.items()})
+                else:
+                    gradient_sample = mix_sample or gradient_sample
                 criterion.components.update({key: value for key, value in mixed_components.items()
                                              if not key.startswith("sampled_")})
-                auxiliary_loss = weight * mixed_components["loss_mix"]
+                auxiliary_loss += weight * mixed_components["loss_mix"]
             optimizer.step()
             if ranker is not None:
                 if rank_strength > 0:
