@@ -50,7 +50,7 @@ class PrototypeMarginTests(unittest.TestCase):
             def __iter__(self):
                 raise AssertionError("Held-out loader was iterated")
 
-        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parents[1] / "tmp") as folder:
+        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent) as folder:
             root = Path(folder)
             raw = root / "raw"
             raw.mkdir()
