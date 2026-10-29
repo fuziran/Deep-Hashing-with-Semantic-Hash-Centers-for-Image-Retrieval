@@ -35,7 +35,7 @@ def margins(features, prototypes, targets):
             or (prototypes.norm(dim=1) <= 1e-12).any()
             or (targets < 0).any() or (targets >= len(prototypes)).any()):
         raise ValueError("Invalid features, prototypes or classes")
-    scores = F.normalize(features, dim=1) @ F.normalize(prototypes, dim=1).T
+    scores = F.normalize(features, dim=1) @ F.normalize(prototypes.to(features), dim=1).T
     own = scores.gather(1, targets[:, None]).squeeze(1)
     other = scores.scatter(1, targets[:, None], -torch.inf)
     nearest = other.argmax(1)

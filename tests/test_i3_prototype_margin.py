@@ -14,7 +14,7 @@ from scripts.diagnose_i3_prototype_margin import analyze, inspect, margins
 
 class PrototypeMarginTests(unittest.TestCase):
     def test_margin_uses_nearest_other_class(self):
-        prototypes = torch.eye(3)
+        prototypes = torch.eye(3, dtype=torch.float64)  # Audited I1 cache uses float64.
         features = torch.tensor([[1., .8, 0.], [.8, 1., 0.]])
         scores, nearest = margins(features, prototypes, torch.tensor([0, 1]))
         self.assertEqual(nearest.tolist(), [1, 0])
