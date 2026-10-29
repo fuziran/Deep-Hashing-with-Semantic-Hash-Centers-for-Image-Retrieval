@@ -65,6 +65,7 @@ class NeighborhoodFeatureDistillation(nn.Module):
                              ranks=ranks, feature_dim=dim)
         self.components = {}
         self.gate_mode = None
+        self.last_teacher_features = None
 
     def train(self, mode=True):
         super().train(mode)
@@ -113,6 +114,7 @@ class NeighborhoodFeatureDistillation(nn.Module):
         self.teacher.eval()
         with torch.no_grad():
             teacher_features = self.teacher.forward_features(images)
+            self.last_teacher_features = teacher_features.detach()
             if self.gate_mode is not None:
                 if self.gate_mode not in ("gated", "mean", "fixed"):
                     raise ValueError("Unknown reliability-gate control mode")

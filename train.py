@@ -189,7 +189,7 @@ def train_val(
 ):
     print(f"========== start {args.info} network training ==========")
     bit = args.code_length
-    if (getattr(args, "variant", "b0") in ("b2nfd", "b3npa", "b3fcd", "b3rnd")) != (nfd is not None):
+    if (getattr(args, "variant", "b0") in ("b2nfd", "b3npa", "b3fcd", "b3rnd", "b3nvc")) != (nfd is not None):
         raise ValueError("NFD variant requires exactly one prepared frozen distiller")
     if npa is not None and getattr(args, "variant", "b0") != "b3npa":
         raise ValueError("NPA requires the b3npa variant")
@@ -255,7 +255,14 @@ def train_val(
         if ranker is not None:
             ranker.reset_diagnostics()
         gradient_sample = {}
-        for batch_index, (images, labels, indices) in enumerate(train_loader):
+        for batch_index, batch in enumerate(train_loader):
+            if getattr(args, "variant", "b0") == "b3nvc":
+                if len(batch) != 4:
+                    raise ValueError("NVC needs paired weak and strong training views")
+                images, labels, indices, strong_images = batch
+                strong_images = strong_images.to(args.device, non_blocking=True)
+            else:
+                images, labels, indices = batch
             images = images.to(args.device, non_blocking=True)
             labels = labels.to(args.device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
@@ -297,6 +304,7 @@ def train_val(
                 criterion.components["rank_weight"] = rank_strength
             elif nfd is not None:
                 combined = loss
+                weak_backward_done = False
                 if nfd_strength > 0:
                     nfd_loss = nfd(features, images, labels.argmax(dim=1))
                     if not torch.isfinite(nfd_loss):
@@ -341,7 +349,54 @@ def train_val(
                     else:
                         criterion.components['loss_fcd'] = 0.
                     criterion.components['fcd_weight'] = fcd_strength
-                combined.backward()
+                if getattr(args, "variant", "b0") == "b3nvc":
+                    from utils.neighborhood_view_consistency import (
+                        ramp as nvc_ramp, semantic_weight, consistency_loss)
+                    strong_strength = nvc_ramp(epoch + 1, args.nvc_strong_weight,
+                                               args.nvc_warmup, args.nvc_ramp_end)
+                    code_strength = nvc_ramp(epoch + 1, args.nvc_weight,
+                                             args.nvc_warmup, args.nvc_ramp_end)
+                    if strong_strength > 0:
+                        if nfd.last_teacher_features is None:
+                            raise RuntimeError("NFD teacher features were not prepared")
+                        # The consistency target uses detached weak logits. Release the
+                        # weak student graph before the second ResNet forward to fit
+                        # the original 64-image batch on a 16-GB GPU.
+                        combined.backward()
+                        weak_backward_done = True
+                        strong_output = net(strong_images)
+                        with torch.no_grad():
+                            strong_teacher = nfd.teacher.forward_features(strong_images)
+                            gate, projected_ratio = semantic_weight(
+                                nfd.last_teacher_features, strong_teacher,
+                                nfd.basis, nfd.ranks, labels.argmax(1),
+                                args.nvc_temperature)
+                        effective = (gate if args.nvc_mode == "semantic"
+                                     else torch.ones_like(gate))
+                        bit_loss, bit_stats = consistency_loss(
+                            output, strong_output, labels.argmax(1),
+                            criterion.hash_targets, effective, args.nvc_margin)
+                        weak_components = criterion.components.copy()
+                        strong_center_loss = criterion(strong_output, labels, indices, args)
+                        criterion.components = weak_components
+                        weighted_strong = strong_strength * strong_center_loss
+                        weighted_code = (code_strength * bit_loss
+                                         if args.nvc_mode != "augment" else bit_loss * 0)
+                        (weighted_strong + weighted_code).backward()
+                        auxiliary_loss += float(weighted_strong.detach() + weighted_code.detach())
+                        criterion.components.update(bit_stats)
+                        criterion.components.update(
+                            nvc_strong_center_loss=float(strong_center_loss.detach()),
+                            nvc_projected_ratio=float(projected_ratio.mean()),
+                            nvc_teacher_gate_mean=float(gate.mean()),
+                            nvc_bit_loss=float(bit_loss.detach()),
+                            nvc_strong_weight=strong_strength,
+                            nvc_weight=(code_strength if args.nvc_mode != "augment" else 0.))
+                    else:
+                        criterion.components.update(nvc_strong_weight=0., nvc_weight=0.,
+                                                    nvc_bit_loss=0.)
+                if not weak_backward_done:
+                    combined.backward()
             else:
                 loss.backward()
             if mixer is not None:

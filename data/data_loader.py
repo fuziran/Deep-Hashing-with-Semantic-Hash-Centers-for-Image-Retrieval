@@ -151,6 +151,18 @@ class CIFAR100HashDataset(Dataset):
         return image, label, torch.tensor(real_idx, dtype=torch.long)
 
 
+class CIFAR100TwoViewDataset(CIFAR100HashDataset):
+    """Return the unchanged weak transform plus one independent strong view."""
+    def __init__(self, *args, strong_transform, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.strong_transform = strong_transform
+
+    def __getitem__(self, item):
+        weak, label, image_id = super().__getitem__(item)
+        strong = self.strong_transform(Image.fromarray(self.images[int(image_id)]))
+        return weak, label, image_id, strong
+
+
 def load_data(args):
     if "cifar" not in args.dataset.lower():
         raise NotImplementedError(
@@ -179,6 +191,13 @@ def load_data(args):
             normalize,
         ]
     )
+    strong_transform = transforms.Compose([
+        transforms.Resize(args.resize_size),
+        transforms.RandomResizedCrop(args.crop_size, scale=(.65, 1.), ratio=(.85, 1.15)),
+        transforms.RandomHorizontalFlip(),
+        transforms.ColorJitter(brightness=.2, contrast=.2, saturation=.2, hue=.04),
+        transforms.ToTensor(), normalize,
+    ])
     eval_transform = transforms.Compose(
         [
             transforms.Resize(args.resize_size),
@@ -193,7 +212,12 @@ def load_data(args):
             images, labels, indices, args.num_classes, transform=transform
         )
 
-    train_dataset = make_dataset(train_idx, train_transform)
+    if getattr(args, "variant", None) == "b3nvc":
+        train_dataset = CIFAR100TwoViewDataset(
+            images, labels, train_idx, args.num_classes, transform=train_transform,
+            strong_transform=strong_transform)
+    else:
+        train_dataset = make_dataset(train_idx, train_transform)
     relation_dataset = make_dataset(train_idx, eval_transform)
     val_dataset = make_dataset(val_idx, eval_transform)
     query_dataset = make_dataset(query_idx, eval_transform)

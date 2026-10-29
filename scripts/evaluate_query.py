@@ -36,7 +36,7 @@ def validate_run(run_dir):
     config = read_json(run_dir / "config.json")
     summary = read_json(run_dir / "metrics.json")
     history = read_json(run_dir / "training_history.json")
-    if (config.get("variant") not in ("b2nfd", "b3fcd", "b3rnd")
+    if (config.get("variant") not in ("b2nfd", "b3fcd", "b3rnd", "b3nvc")
             or config.get("dataset") != "cifar-100-new-seg"
             or config.get("num_classes") != 100
             or config.get("paired_stage_seeds") is not True
