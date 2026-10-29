@@ -10,7 +10,7 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
-from scripts.diagnose_rgnfd_gate import inspect, summarize, analyze
+from scripts.diagnose_rgnfd_gate import inspect, summarize, analyze, compare_validation
 from scripts.run_i3_npa import SHARED, ARTIFACTS
 from scripts.run_i3_rgnfd import build_command
 from utils.neighbor_feature_distill import NeighborhoodFeatureDistillation, RELIABLE_VERSION
@@ -128,6 +128,36 @@ class ReliableNFDTests(unittest.TestCase):
             self.assertEqual(report["training"]["gate_fraction"], .5)
             self.assertTrue((root / "output" / "gate_diagnostic.json").is_file())
 
+    def test_validation_comparison_uses_recomputed_data_hash_for_legacy_config(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            reference = root / "nfd_run"
+            ordinary = root / "fd_run"
+            audit_root = root / "audit"
+            for run, alpha in ((reference, .75), (ordinary, 0)):
+                run.mkdir()
+                (run / "config.json").write_text(json.dumps(dict(
+                    variant="b2nfd", nfd_alpha=alpha)), encoding="utf-8")
+            for name, run, values in (("nfd", reference, (.6, .2)),
+                                      ("ordinary_fd", ordinary, (.5, .3))):
+                audit = audit_root / name
+                audit.mkdir(parents=True)
+                (audit / "diagnostic.json").write_text(json.dumps(dict(
+                    run_dir=str(run), split_hash="split", dataset_content_sha256="pixels",
+                    code_length=32, seed=60)), encoding="utf-8")
+                with (audit / "per_query_validation.csv").open("w", newline="") as stream:
+                    stream.write("validation_id,binary_hamming_mAP@ALL\n")
+                    stream.write(f"3,{values[0]}\n5,{values[1]}\n")
+            result = compare_validation(
+                [dict(image_id=3, gate=True), dict(image_id=5, gate=False)],
+                audit_root,
+                dict(split_hash="split", code_length=32, seed=60, nfd_alpha=.75),
+                reference, "pixels")
+            self.assertAlmostEqual(
+                result["trusted"]["nfd_minus_ordinary_binary_mAP_ALL"], .1)
+            self.assertAlmostEqual(
+                result["untrusted"]["nfd_minus_ordinary_binary_mAP_ALL"], -.1)
+
     def test_launcher_inherits_reference_and_never_asks_for_query(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
@@ -161,6 +191,9 @@ class ReliableNFDTests(unittest.TestCase):
             self.assertIn("--skip-query", command)
             self.assertNotIn("--evaluate-query", command)
             self.assertEqual(command[command.index("--nfd-alpha") + 1], "0.75")
+            del config["dataset_content_sha256"]
+            config_path.write_text(json.dumps(config))
+            self.assertIn("b3rnd", build_command(config_path, report_path, options))
             report = json.loads(report_path.read_text())
             report["projection_sha256"] = "wrong"
             report_path.write_text(json.dumps(report))

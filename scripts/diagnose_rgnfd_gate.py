@@ -78,13 +78,14 @@ def summarize(rows):
                 class_gate_fraction=class_gate)
 
 
-def compare_validation(rows, audit_root, reference_config, reference_dir):
+def compare_validation(rows, audit_root, reference_config, reference_dir,
+                       dataset_content_sha256):
     by_id = {row["image_id"]: row for row in rows}
     ap = {}
     for name in ("nfd", "ordinary_fd"):
         audit = json.loads((Path(audit_root) / name / "diagnostic.json").read_text(encoding="utf-8"))
         if (audit.get("split_hash") != reference_config["split_hash"]
-                or audit.get("dataset_content_sha256") != reference_config["dataset_content_sha256"]
+                or audit.get("dataset_content_sha256") != dataset_content_sha256
                 or audit.get("code_length") != reference_config["code_length"]
                 or audit.get("seed") != reference_config["seed"]):
             raise ValueError("Frozen-student audit identity differs from the NFD reference")
@@ -158,7 +159,8 @@ def analyze(options):
         report["training_gate_has_variation"] = 0.05 <= report["training"]["gate_fraction"] <= 0.95
         if options.audit_root:
             report["validation_group_delta"] = compare_validation(
-                heldout, options.audit_root, config, config_path.parent)
+                heldout, options.audit_root, config, config_path.parent,
+                args.dataset_content_sha256)
         report["note"] = ("Exploratory feasibility only. The actual training gate is computed online on "
                           "each augmented batch, so these one-pass rates may differ. Validation groups "
                           "are descriptive, not independent evidence or a threshold-tuning set.")

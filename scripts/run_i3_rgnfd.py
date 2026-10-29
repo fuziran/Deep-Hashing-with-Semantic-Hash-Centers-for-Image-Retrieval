@@ -34,7 +34,9 @@ def build_command(config_path, report_path, options):
             or report.get("training_gate_has_variation") is not True
             or Path(report.get("reference_run", "")).resolve() != config_path.parent
             or report.get("split_hash") != config.get("split_hash")
-            or report.get("dataset_content_sha256") != config.get("dataset_content_sha256")
+            or not report.get("dataset_content_sha256")
+            or (config.get("dataset_content_sha256") is not None
+                and report["dataset_content_sha256"] != config["dataset_content_sha256"])
             or report.get("teacher_sha256") != config.get("nfd_teacher_sha256")
             or report.get("projection_sha256") != config.get("nfd_basis_sha256")):
         raise ValueError("Gate report does not match the frozen NFD run or lacks variation")
