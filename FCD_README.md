@@ -459,3 +459,22 @@ It must be finite and in [0,1]. A pilot at `kd_scale=0.05` tests whether a
 smaller teacher-logit gradient adds value beyond the completed CE control;
 it is not itself evidence of a new method. Keep query evaluation disabled for
 this exploratory, failed-original-gate teacher cache.
+
+The completed 300-epoch `kd_scale=0.05` plain pilot selected epoch 300 and
+reached validation mAP@ALL 0.568570, mAP@100 0.671359, and mAP@1000 0.647856.
+All three are below the completed CE control (0.573391, 0.675099, 0.653127).
+The result also falls below the original plain DKD mAP@ALL 0.572528. Shrinking
+the DKD gradient alone did not recover the CE control; the observed negative
+gradient cosine is therefore a diagnostic association, not a demonstrated
+cause. Stop this FCD configuration's code-length and weight search.
+
+`scripts/diagnose_i3_validation.py` compares the frozen B1+NFD and CE models
+on the original validation vs database protocol. It checks the saved selected
+epoch, full history, available selection receipts, split and pixel hash,
+strictly loads student checkpoints, and checks recomputed mAP against the
+recorded validation metrics. It never iterates final query images. Outputs
+include per-query and per-class AP, top-100 false-positive counts, boundary
+Hamming tie counts, and descriptive paired bootstrap intervals. Historical
+NFD runs may lack a selection receipt; the report records that limitation.
+Validation queries already selected both models, so bootstrap intervals are
+descriptive and are not independent confirmation.
