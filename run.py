@@ -25,7 +25,7 @@ from utils.experiment import (
 def load_config():
     parser = argparse.ArgumentParser(description="Faithful and auditable SHC B0 baseline")
     parser.add_argument("--seed", default=60, type=int)
-    parser.add_argument("--variant", choices=("b0", "b1", "b2", "b2r", "b2m", "b2sbr", "b2nfd", "b3npa", "b3fcd"), default="b0")
+    parser.add_argument("--variant", choices=("b0", "b1", "b2", "b2r", "b2m", "b2sbr", "b2nfd", "b3npa", "b3fcd", "b3rnd"), default="b0")
     parser.add_argument("--relation-mode",
                         choices=("full", "two_view", "weighted", "fixed_fusion", "feature_only"),
                         default="full")
@@ -119,6 +119,10 @@ def load_config():
     parser.add_argument("--nfd-topk", type=int, default=5)
     parser.add_argument("--nfd-warmup", type=int, default=20)
     parser.add_argument("--nfd-ramp-end", type=int, default=40)
+    parser.add_argument("--rgnfd-mode", choices=("gated", "mean", "fixed"), default="gated",
+                        help="I3 reliability gate, batch-mean alpha control, or fixed NFD control.")
+    parser.add_argument("--rgnfd-gate-diagnostic", default=None,
+                        help="Audited training-only gate feasibility report for the I3 pilot.")
     parser.add_argument("--npa-mode", choices=("protected", "covariance", "isotropic"), default="protected")
     parser.add_argument("--npa-rho", type=float, default=.05)
     parser.add_argument("--npa-shrinkage", type=float, default=.2)
@@ -172,8 +176,8 @@ def load_config():
         except ValueError as error:
             parser.error(str(error))
         args.npa_version = VERSION
-    if args.variant in ("b2nfd", "b3npa", "b3fcd"):
-        from utils.neighbor_feature_distill import VERSION, nfd_weight
+    if args.variant in ("b2nfd", "b3npa", "b3fcd", "b3rnd"):
+        from utils.neighbor_feature_distill import VERSION, RELIABLE_VERSION, nfd_weight
         try:
             nfd_weight(1, args.nfd_weight, args.nfd_warmup, args.nfd_ramp_end)
             if not math.isfinite(args.nfd_alpha) or not 0 <= args.nfd_alpha < 1:
@@ -190,8 +194,30 @@ def load_config():
         args.nfd_feature_dim = 512
         args.nfd_teacher_policy = "frozen-eval-same-augmented-input"
         args.nfd_projection_policy = "i1-topk-prototype-differences-svd-trace-normalized"
+        if args.variant == "b3rnd":
+            if args.nfd_alpha <= 0 or args.nfd_weight <= 0 or args.skip_query is False:
+                parser.error("I3 reliable NFD pilot requires positive NFD alpha/weight and --skip-query")
+            if not args.rgnfd_gate_diagnostic:
+                parser.error("I3 reliable NFD requires --rgnfd-gate-diagnostic")
+            try:
+                from pathlib import Path
+                from utils.experiment import file_sha256
+                gate_report = json.loads(Path(args.rgnfd_gate_diagnostic).read_text(encoding="utf-8"))
+                if (gate_report.get("version") != RELIABLE_VERSION
+                        or gate_report.get("training_gate_has_variation") is not True):
+                    raise ValueError("Gate feasibility report is missing or has no training variation")
+                args.rgnfd_gate_diagnostic_sha256 = file_sha256(args.rgnfd_gate_diagnostic)
+                args.rgnfd_gate_training_fraction = gate_report["training"]["gate_fraction"]
+                args.rgnfd_expected_split_hash = gate_report["split_hash"]
+                args.rgnfd_expected_dataset_sha256 = gate_report["dataset_content_sha256"]
+                args.rgnfd_expected_teacher_sha256 = gate_report["teacher_sha256"]
+                args.rgnfd_expected_projection_sha256 = gate_report["projection_sha256"]
+            except (OSError, ValueError, KeyError, TypeError) as error:
+                parser.error(f"Invalid I3 gate report: {error}")
+            args.rgnfd_version = RELIABLE_VERSION
+            args.rgnfd_gate_policy = "teacher-correct-on-original-and-horizontal-flip"
     elif args.teacher_cache:
-        parser.error("--teacher-cache requires --variant b2nfd/b3npa")
+        parser.error("--teacher-cache requires an NFD-based variant")
     if args.resume_sbr and args.variant != "b2sbr":
         parser.error("--resume-sbr requires --variant b2sbr")
     if args.variant == "b2sbr":
@@ -236,7 +262,7 @@ def load_config():
         except ValueError as error:
             parser.error(str(error))
         args.i2r_version = VERSION
-    if args.variant in ("b2", "b2r", "b2m", "b2sbr", "b2nfd", "b3npa", "b3fcd"):
+    if args.variant in ("b2", "b2r", "b2m", "b2sbr", "b2nfd", "b3npa", "b3fcd", "b3rnd"):
         if not all((args.parent_b1_config, args.similarity_cache, args.center_cache)):
             parser.error("B2/B2R/B2M/B2SBR/B2NFD requires --parent-b1-config, --similarity-cache and --center-cache")
         if not args.paired_stage_seeds or args.force_recompute:
@@ -303,6 +329,10 @@ def main():
         _,
         num_database,
     ) = load_data(args)
+    if args.variant == "b3rnd" and (
+            args.split_hash != args.rgnfd_expected_split_hash
+            or args.dataset_content_sha256 != args.rgnfd_expected_dataset_sha256):
+        raise ValueError("I3 gate report data/split differs from this training run")
 
     run_config = {
         "dataset": args.dataset,
@@ -318,13 +348,13 @@ def main():
         "validation_per_class": args.val_per_class,
         "git_commit": args.git_commit,
     }
-    if args.variant in ("b1", "b2", "b2r", "b2m", "b2sbr", "b2nfd", "b3npa", "b3fcd"):
+    if args.variant in ("b1", "b2", "b2r", "b2m", "b2sbr", "b2nfd", "b3npa", "b3fcd", "b3rnd"):
         from utils.reliable_relation import relation_config
         run_config["variant"] = args.variant
         run_config["relation"] = relation_config(args)
     if args.paired_stage_seeds:
         run_config["paired_stage_seeds"] = True
-    if args.variant in ("b1", "b2", "b2r", "b2m", "b2sbr", "b2nfd", "b3npa", "b3fcd") or args.paired_stage_seeds:
+    if args.variant in ("b1", "b2", "b2r", "b2m", "b2sbr", "b2nfd", "b3npa", "b3fcd", "b3rnd") or args.paired_stage_seeds:
         run_config.update({
             "source_sha256": args.source_sha256,
             "batch_size": args.batch_size,
@@ -341,12 +371,16 @@ def main():
     fcd = None
     if args.skip_query:
         run_config["skip_query"] = True
-    if args.variant in ("b2", "b2r", "b2m", "b2sbr", "b2nfd", "b3npa", "b3fcd"):
+    if args.variant in ("b2", "b2r", "b2m", "b2sbr", "b2nfd", "b3npa", "b3fcd", "b3rnd"):
         from utils.frozen_b1 import load_frozen_b1
         similarity, centers = load_frozen_b1(args)
-        if args.variant in ("b2nfd", "b3npa", "b3fcd"):
+        if args.variant in ("b2nfd", "b3npa", "b3fcd", "b3rnd"):
             from utils.neighbor_feature_distill import load_nfd
             nfd = load_nfd(args)
+            if args.variant == "b3rnd" and (
+                    args.nfd_teacher_sha256 != args.rgnfd_expected_teacher_sha256
+                    or args.nfd_basis_sha256 != args.rgnfd_expected_projection_sha256):
+                raise ValueError("I3 gate report teacher/projection differs from this training run")
         if args.variant == "b3npa":
             from utils.neighborhood_protected_augmentation import prepare_npa
             npa = prepare_npa(args, nfd, relation_loader, train_loader)
@@ -355,8 +389,8 @@ def main():
             fcd = load_fcd(args, centers, similarity, train_loader.dataset)
         run_config.update({key: value for key, value in vars(args).items()
                            if key.startswith("parent_")
-                           or key.startswith({"b2": "comp_", "b2r": "i2r_", "b2m": "mix_", "b2sbr": "rank_", "b2nfd": "nfd_", "b3npa": "npa_", "b3fcd": "fcd_"}[args.variant])
-                           or (args.variant in ("b3npa", "b3fcd") and key.startswith("nfd_"))})
+                           or key.startswith({"b2": "comp_", "b2r": "i2r_", "b2m": "mix_", "b2sbr": "rank_", "b2nfd": "nfd_", "b3npa": "npa_", "b3fcd": "fcd_", "b3rnd": "rgnfd_"}[args.variant])
+                           or (args.variant in ("b3npa", "b3fcd", "b3rnd") and key.startswith("nfd_"))})
         run_config.update({
             "center_content_sha256": args.center_content_sha256,
             "similarity_content_sha256": args.similarity_content_sha256,
@@ -367,7 +401,7 @@ def main():
         "runs",
         f"{args.dataset}_{args.variant.upper()}_{args.code_length}bit_seed{args.seed}_{args.run_id}",
     )
-    if args.variant in ("b2", "b2r", "b2m", "b2sbr", "b2nfd", "b3npa", "b3fcd") and os.path.exists(args.run_dir):
+    if args.variant in ("b2", "b2r", "b2m", "b2sbr", "b2nfd", "b3npa", "b3fcd", "b3rnd") and os.path.exists(args.run_dir):
         raise FileExistsError(f"Run already exists; choose a new --output-dir: {args.run_dir}")
     if args.variant == "b2sbr":
         print("SBR configuration=" + json.dumps({
@@ -389,7 +423,7 @@ def main():
                    os.path.join(args.run_dir, "nfd_projection.pt"))
         print("NFD configuration=" + json.dumps(nfd.identity))
 
-    if args.variant not in ("b2", "b2r", "b2m", "b2sbr", "b2nfd", "b3npa", "b3fcd"):
+    if args.variant not in ("b2", "b2r", "b2m", "b2sbr", "b2nfd", "b3npa", "b3fcd", "b3rnd"):
         similarity = GenerateSimilarityMatrix(
             args, train_loader, relation_loader, val_loader
         )
@@ -397,7 +431,7 @@ def main():
     if args.stage == "similarity":
         return
 
-    if args.variant not in ("b2", "b2r", "b2m", "b2sbr", "b2nfd", "b3npa", "b3fcd"):
+    if args.variant not in ("b2", "b2r", "b2m", "b2sbr", "b2nfd", "b3npa", "b3fcd", "b3rnd"):
         centers = GenerateSemanticHashCenters(args, similarity.to(args.device))
     from utils.reliable_relation import tensor_sha256
     args.center_content_sha256 = tensor_sha256(centers)
@@ -416,7 +450,7 @@ def main():
         query_loader,
         database_loader,
         num_database,
-        similarity=similarity if args.variant in ("b2", "b2r", "b2m", "b2sbr", "b2nfd", "b3npa", "b3fcd") else None,
+        similarity=similarity if args.variant in ("b2", "b2r", "b2m", "b2sbr", "b2nfd", "b3npa", "b3fcd", "b3rnd") else None,
         nfd=nfd,
         npa=npa,
         fcd=fcd,

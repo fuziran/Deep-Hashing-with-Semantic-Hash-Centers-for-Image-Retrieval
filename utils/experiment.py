@@ -111,7 +111,7 @@ def build_cache_metadata(args, stage):
         )
     if stage in {"mds", "centers"}:
         metadata["code_length"] = args.code_length
-    if stage in {"similarity", "centers"} and getattr(args, "variant", "b0") in ("b1", "b2", "b2r", "b2m", "b2sbr", "b2nfd", "b3npa", "b3fcd"):
+    if stage in {"similarity", "centers"} and getattr(args, "variant", "b0") in ("b1", "b2", "b2r", "b2m", "b2sbr", "b2nfd", "b3npa", "b3fcd", "b3rnd"):
         from utils.reliable_relation import relation_config
         metadata["relation"] = relation_config(args)
         if stage == "similarity":

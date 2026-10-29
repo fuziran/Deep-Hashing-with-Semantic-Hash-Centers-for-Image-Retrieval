@@ -34,7 +34,7 @@ def checked_run(path):
     config = read_json(path / "config.json")
     summary = read_json(path / "metrics.json")
     history = read_json(path / "training_history.json")
-    if (config.get("variant") not in ("b2nfd", "b3fcd")
+    if (config.get("variant") not in ("b2nfd", "b3fcd", "b3rnd")
             or config.get("dataset") != "cifar-100-new-seg"
             or config.get("num_classes") != 100
             or config.get("topK") != [-1, 100, 1000]

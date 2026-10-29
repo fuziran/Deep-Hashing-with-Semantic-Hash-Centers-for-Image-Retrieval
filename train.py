@@ -189,7 +189,7 @@ def train_val(
 ):
     print(f"========== start {args.info} network training ==========")
     bit = args.code_length
-    if (getattr(args, "variant", "b0") in ("b2nfd", "b3npa", "b3fcd")) != (nfd is not None):
+    if (getattr(args, "variant", "b0") in ("b2nfd", "b3npa", "b3fcd", "b3rnd")) != (nfd is not None):
         raise ValueError("NFD variant requires exactly one prepared frozen distiller")
     if npa is not None and getattr(args, "variant", "b0") != "b3npa":
         raise ValueError("NPA requires the b3npa variant")
