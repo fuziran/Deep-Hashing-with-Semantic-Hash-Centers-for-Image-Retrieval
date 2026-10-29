@@ -29,6 +29,7 @@ def build_command(path,config,options):
     if not data_root.is_dir(): raise ValueError(f'Data root does not exist: {data_root}')
     command+=['--root',str(data_root.resolve()),'--gpu',str(options.gpu),'--topK','-1','100','1000',
               '--output-dir',str(output),'--fcd-mode',options.mode,'--fcd-weight',str(options.weight),
+              '--fcd-kd-scale',str(options.kd_scale),
               '--fcd-temperature',str(options.temperature),'--fcd-gamma',str(options.gamma),
               '--fcd-topk',str(options.topk),'--fcd-warmup',str(options.warmup),'--fcd-ramp-end',str(options.ramp_end)]
     if options.weight>0: command+=['--fcd-cache',str(Path(options.teacher_cache).resolve())]
@@ -52,6 +53,8 @@ def main():
     parser.add_argument('--data-root')
     parser.add_argument('--mode',choices=('ce','plain','neighbor'),default='neighbor')
     parser.add_argument('--weight',type=float,default=.05)
+    parser.add_argument('--kd-scale',type=float,default=1.,
+                        help='Scale teacher DKD only; keep auxiliary CE and outer weight fixed')
     parser.add_argument('--temperature',type=float,default=2.)
     parser.add_argument('--gamma',type=float,default=1.)
     parser.add_argument('--topk',type=int,default=5)
@@ -62,8 +65,10 @@ def main():
     parser.add_argument('--dry-run',action='store_true')
     options=parser.parse_args()
     if (not options.bits or len(set(options.bits))!=len(options.bits) or any(b not in (16,32,64) for b in options.bits)
-            or not all(math.isfinite(v) for v in (options.weight,options.temperature,options.gamma))
+            or not all(math.isfinite(v) for v in (options.weight,options.kd_scale,
+                                                  options.temperature,options.gamma))
             or options.weight<0 or options.temperature<=0 or not 0<=options.gamma<=1
+            or not 0<=options.kd_scale<=1
             or not 0<=options.warmup<options.ramp_end or options.topk<1):
         parser.error('Invalid FCD options')
     root=Path(options.output_root).resolve()

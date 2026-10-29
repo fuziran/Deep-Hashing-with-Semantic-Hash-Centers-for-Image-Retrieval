@@ -439,3 +439,23 @@ done
 新流程本地合成验证通过不等同真实DINO权重、CUDA或CIFAR-100指标验证。
 本次新增8项独立评价及数据摘要测试，以及独立DINOv3环境版本门槛测试；合成教师准备测试隔离了真实DINOv3运行时要求，避免要求原SHC环境升级。
 107项完整CPU回归在PyTorch 2.2.2 / torchvision 0.17.2通过；PyTorch 2.14.0 CPU也完成完整回归及最终FCD测试复核。启动脚本通过Bash语法检查，以及正常顺序、教师失败停止、plain训练失败停止三种模拟流程检查。
+
+## Seed-60 32-bit exploratory follow-up: isolated teacher-logit strength
+
+The validation-only screen selected CE at 0.573391 mAP@ALL, plain DKD at
+0.572528, neighbor DKD at 0.570476, and the paired B1+NFD reference at
+0.567751. CE uses hard labels but no teacher logits. Over epochs 60–300,
+the median cosine between the weighted FCD gradient and the current main-loss
+gradient was +0.9610 for CE, -0.7678 for plain, and -0.7358 for neighbor.
+This motivates a single controlled ablation before expanding code lengths.
+
+`--kd-scale` in `scripts/run_i3_fcd.py` (forwarded as `--fcd-kd-scale`) changes
+the auxiliary loss from `CE + TCKD + NCKD` to
+`CE + kd_scale * (TCKD + NCKD)`. The existing outer `--weight 0.05`,
+warmup, and NFD settings stay fixed. The default `kd_scale=1` retains the
+previous formula. The new scale is recorded in the run manifest, and the raw
+teacher terms plus their scaled contribution are recorded in training history.
+It must be finite and in [0,1]. A pilot at `kd_scale=0.05` tests whether a
+smaller teacher-logit gradient adds value beyond the completed CE control;
+it is not itself evidence of a new method. Keep query evaluation disabled for
+this exploratory, failed-original-gate teacher cache.

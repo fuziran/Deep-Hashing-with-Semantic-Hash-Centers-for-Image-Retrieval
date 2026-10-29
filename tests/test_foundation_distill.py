@@ -91,6 +91,29 @@ class FormulaTests(unittest.TestCase):
         self.assertTrue(((weights>=1)&(weights<=2)).all())
         torch.testing.assert_close(weights.diag(),torch.ones(3))
 
+    def test_kd_scale_changes_only_teacher_term_and_its_gradient(self):
+        codes=torch.randn(3,4,requires_grad=True)
+        targets=torch.arange(3);ids=torch.arange(3)
+        ce=self.module('ce')
+        plain=self.module('plain')
+        scaled=FoundationDistillation(H,S,torch.arange(12),
+                   F.one_hot(torch.arange(12)%3,3).float()*4,torch.arange(12)%3,
+                   'plain',2.,1.,2,.05)
+        ce_loss=ce(codes,targets,ids)
+        plain_loss=plain(codes,targets,ids)
+        scaled_loss=scaled(codes,targets,ids)
+        torch.testing.assert_close(scaled_loss,ce_loss+.05*(plain_loss-ce_loss))
+        self.assertEqual(plain.components['fcd_ce'],scaled.components['fcd_ce'])
+        self.assertEqual(plain.components['fcd_tckd'],scaled.components['fcd_tckd'])
+        self.assertEqual(plain.components['fcd_nckd'],scaled.components['fcd_nckd'])
+        grads=[torch.autograd.grad(loss,codes,retain_graph=True)[0]
+               for loss in (ce_loss,plain_loss,scaled_loss)]
+        torch.testing.assert_close(grads[2],grads[0]+.05*(grads[1]-grads[0]))
+        with self.assertRaisesRegex(ValueError,'Invalid'):
+            FoundationDistillation(H,S,torch.arange(12),
+                F.one_hot(torch.arange(12)%3,3).float()*4,torch.arange(12)%3,
+                'plain',2.,1.,2,float('nan'))
+
     def test_rng_head_gradient_teacher_detachment_and_id_guards(self):
         rng=torch.get_rng_state().clone();module=self.module()
         self.assertTrue(torch.equal(rng,torch.get_rng_state()))
@@ -216,7 +239,9 @@ class EntryTests(unittest.TestCase):
             self.assertIsNone(train.call_args.kwargs['npa'])
             manifest=json.loads((Path(child.run_dir)/'config.json').read_text())
             self.assertIn('fcd_cache_sha256',manifest);self.assertIn('nfd_basis_sha256',manifest)
-            for extra in [['--fcd-temperature','nan'],['--fcd-gamma','2'],['--fcd-topk','3'],['--fcd-ramp-end','301']]:
+            for extra in [['--fcd-temperature','nan'],['--fcd-gamma','2'],['--fcd-topk','3'],
+                          ['--fcd-ramp-end','301'],['--fcd-kd-scale','nan'],
+                          ['--fcd-kd-scale','-0.1'],['--fcd-kd-scale','1.1']]:
                 with patch('sys.argv',argv+extra),patch('sys.stderr'),self.assertRaises(SystemExit):run.load_config()
 
 
@@ -332,6 +357,10 @@ class LauncherTests(unittest.TestCase):
             with patch('sys.argv',pilot),patch('subprocess.run') as process,patch('builtins.print'):
                 launch.main()
             process.assert_not_called()
+            with patch('sys.argv',pilot+['--kd-scale','.05']), \
+                 patch('builtins.print') as output_print:
+                launch.main()
+            self.assertIn('--fcd-kd-scale 0.05',output_print.call_args.args[0])
             with patch('sys.argv',pilot+['--evaluate-query']),patch('sys.stderr'),self.assertRaises(SystemExit):
                 launch.main()
 

@@ -128,6 +128,8 @@ def load_config():
     parser.add_argument("--fcd-cache", default=None)
     parser.add_argument("--fcd-mode", choices=("ce", "plain", "neighbor"), default="neighbor")
     parser.add_argument("--fcd-weight", type=float, default=.05)
+    parser.add_argument("--fcd-kd-scale", type=float, default=1.,
+                        help="Scale only teacher-logit DKD; CE and outer FCD weight stay fixed.")
     parser.add_argument("--fcd-temperature", type=float, default=2.)
     parser.add_argument("--fcd-gamma", type=float, default=1.)
     parser.add_argument("--fcd-topk", type=int, default=5)
@@ -144,6 +146,8 @@ def load_config():
                 raise ValueError("FCD temperature must be finite and positive")
             if not math.isfinite(args.fcd_gamma) or not 0 <= args.fcd_gamma <= 1:
                 raise ValueError("FCD gamma must be finite in [0,1]")
+            if not math.isfinite(args.fcd_kd_scale) or not 0 <= args.fcd_kd_scale <= 1:
+                raise ValueError("FCD KD scale must be finite in [0,1]")
             if not 0 < args.fcd_topk < args.num_classes:
                 raise ValueError("FCD topk must be smaller than num-classes")
             if args.fcd_weight > 0 and (not args.fcd_cache or args.epoch < args.fcd_ramp_end):

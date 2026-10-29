@@ -9,7 +9,7 @@ from torch.nn import functional as F
 
 from utils.reliable_relation import tensor_sha256
 
-VERSION = "i3-foundation-discriminative-v1"
+VERSION = "i3-foundation-discriminative-v2"
 CACHE_VERSION = "foundation-teacher-logits-v1"
 
 
@@ -99,7 +99,7 @@ def decoupled_loss(student, teacher, targets, temperature=2., weights=None):
 
 class FoundationDistillation(nn.Module):
     def __init__(self, centers, similarity, ids, logits, labels, mode='neighbor',
-                 temperature=2., gamma=1., topk=5):
+                 temperature=2., gamma=1., topk=5, kd_scale=1.):
         super().__init__()
         classes, bits = centers.shape
         if (mode not in ('ce','plain','neighbor') or classes < 3
@@ -112,6 +112,7 @@ class FoundationDistillation(nn.Module):
                 or len(ids.unique()) != len(ids) or (ids[1:] <= ids[:-1]).any()
                 or not math.isfinite(temperature) or temperature <= 0
                 or not math.isfinite(gamma) or not 0 <= gamma <= 1
+                or not math.isfinite(kd_scale) or not 0 <= kd_scale <= 1
                 or not isinstance(topk,int) or not 0 < topk < classes):
             raise ValueError('Invalid FCD centers/cache/options')
         # Preserve paired initialization/RNG, including in zero-weight controls.
@@ -129,7 +130,7 @@ class FoundationDistillation(nn.Module):
             if mode=='neighbor':
                 weights[y,near] += gamma*similarity[y,near].detach().cpu().clamp(0,1)
         self.register_buffer('negative_weights',weights)
-        self.mode,self.temperature=mode,temperature
+        self.mode,self.temperature,self.kd_scale=mode,temperature,kd_scale
         self.components={}
 
     def forward(self, codes, targets, image_ids):
@@ -146,10 +147,12 @@ class FoundationDistillation(nn.Module):
         else:
             tckd,nckd=decoupled_loss(prediction,self.teacher_logits[positions],targets,self.temperature,
                                     self.negative_weights[targets] if self.mode=='neighbor' else None)
-        loss=ce+tckd+nckd
+        loss=ce+self.kd_scale*(tckd+nckd)
         if not torch.isfinite(loss): raise FloatingPointError('Non-finite FCD loss')
         self.components=dict(loss_fcd=loss.detach().item(),fcd_ce=ce.detach().item(),
                              fcd_tckd=tckd.detach().item(),fcd_nckd=nckd.detach().item(),
+                             fcd_kd_scale=self.kd_scale,
+                             fcd_kd_contribution=(self.kd_scale*(tckd+nckd)).detach().item(),
                              fcd_neighbor_weight_mean=self.negative_weights[targets].mean().item(),
                              fcd_student_aux_accuracy=(prediction.detach().argmax(1)==targets).float().mean().item())
         return loss
@@ -190,7 +193,8 @@ def load_fcd(args, centers, similarity, train_dataset):
         args.fcd_original_teacher_check_passed = True
     if centers.shape != (args.num_classes,args.code_length): centers=centers.T
     module=FoundationDistillation(centers,similarity,payload['ids'],payload['logits'],payload['labels'],
-                                  args.fcd_mode,args.fcd_temperature,args.fcd_gamma,args.fcd_topk)
+                                  args.fcd_mode,args.fcd_temperature,args.fcd_gamma,args.fcd_topk,
+                                  getattr(args,'fcd_kd_scale',1.))
     args.fcd_cache_sha256=file_sha256(args.fcd_cache)
     args.fcd_foundation_weights_sha256=identity['foundation_weights_sha256']
     args.fcd_teacher_identity=identity
