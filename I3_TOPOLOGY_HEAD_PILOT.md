@@ -68,3 +68,33 @@ fails, do not scan coefficients, epochs, hidden width or pair weights on this
 validation split. The backbone was already selected on the same validation
 split, so all paired intervals are descriptive. A promising candidate still
 needs novelty review, frozen settings and fresh paired seeds before query.
+
+## Completed seed-60 pilot (user-reported, 2026-10-31)
+
+The user returned all five validation results. Every trained arm completed
+the fixed five epochs, the original result was reproduced, and final query
+evaluation remained false. The local checkout did not independently read the
+remote result/model artifacts.
+
+| Method | mAP@ALL | mAP@100 | mAP@1000 | Mean false top-100 |
+| --- | ---: | ---: | ---: | ---: |
+| Original B1+NFD | 0.567751 | 0.668755 | 0.647944 | 34.538 |
+| center_mlp | 0.566342 | 0.667953 | 0.646378 | 34.582 |
+| cv_control | 0.539119 | 0.671879 | 0.653763 | 34.004 |
+| global_topology | 0.539344 | 0.672371 | 0.653871 | 34.049 |
+| nfd_topology | 0.454079 | 0.631383 | 0.585243 | 39.206 |
+
+NFD topology minus the original was -0.113672, -0.037372 and -0.062701.
+It was also lower than every matched control on all three metrics. Relative
+to global topology the deltas were -0.085264, -0.040988 and -0.068628.
+The controls' small @100/@1000 improvements came with lower mAP@ALL; they do
+not satisfy the registered all-metric requirement. Do not switch the primary
+metric after inspecting this result.
+
+**Decision: stop this topology-head candidate.** Do not increase epochs,
+scan topology weights, expand to other bit lengths or evaluate final query
+for this recipe. This is a failed adaptation on frozen NFD features, not a
+reproduction-based refutation of CroVCA. The result summary establishes the
+failure but cannot identify its cause (for example code collisions or an
+optimization issue) without inspecting saved heads and training histories.
+No verified third innovation has been obtained from this pilot.
