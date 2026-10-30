@@ -57,3 +57,29 @@ and [semantic hash centers (ACCV 2022)](https://openaccess.thecvf.com/content/AC
 The narrow candidate here is the explicit use of the existing NFD-aligned
 prototype differences to calibrate the final head. This pilot is not a
 systematic novelty review or proof of an original contribution.
+
+## Completed seed-60 pilot (user-reported)
+
+The user returned the completed remote pilot summary. The original head's
+validation score was reproduced and `query_evaluated` was false. The local
+checkout did not independently read the remote JSON or checkpoint outputs.
+
+| Head | mAP@ALL | mAP@100 | mAP@1000 | Mean false top-100 |
+| --- | ---: | ---: | ---: | ---: |
+| Original | 0.567751 | 0.668755 | 0.647944 | 34.538 |
+| Ordinary ridge | 0.568787 | 0.668291 | 0.648684 | 34.422 |
+| Global geometry | 0.569098 | 0.669032 | 0.648689 | 34.373 |
+| NFD geometry | 0.568245 | 0.666750 | 0.647491 | 34.491 |
+
+NFD geometry minus ordinary ridge was -0.000542, -0.001540 and -0.001193.
+NFD geometry minus global geometry was -0.000852, -0.002282 and -0.001198.
+Relative to the original head, the NFD candidate's ALL gain was only 0.000494,
+while @100 and @1000 declined. It therefore fails the registered gate.
+The small gains of the other refits are exploratory and do not establish a
+new mechanism or recovery of the continuous-to-binary retrieval gap.
+
+**Decision: stop this fixed readout candidate.** Do not run final query, expand
+to 16/64 bits or scan the graph/ridge coefficients for this formulation on
+the same validation set. This result does not prove that every possible
+hash-head architecture or fitting method is ineffective. No verified third
+innovation has been obtained from this pilot.
