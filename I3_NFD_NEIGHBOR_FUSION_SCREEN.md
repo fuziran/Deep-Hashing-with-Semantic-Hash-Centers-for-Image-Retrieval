@@ -42,3 +42,28 @@ fresh paired seeds, and a careful novelty check before final-query evaluation.
 Adaptive test-time augmentation and prototype-guided hashing have prior art;
 this specific combination is only a candidate until both efficacy and a
 defensible contribution beyond those methods are established.
+
+## Seed-60 screening result (user-reported, 2026-10-30)
+
+The remote screen completed and reproduced the original selected validation
+score. Values below were returned by the user from `neighbor_view_fusion.json`;
+the local checkout did not independently read the remote artifact.
+
+| Frozen policy | mAP@ALL | mAP@100 | mAP@1000 | Mean false top-100 |
+| --- | ---: | ---: | ---: | ---: |
+| Original one view | 0.567751 | 0.668755 | 0.647944 | 34.538 |
+| Equal two-view average | **0.581706** | **0.679484** | **0.660560** | **33.278** |
+| All-prototype weighting | 0.573891 | 0.670225 | 0.655021 | 34.026 |
+| NFD-neighbor weighting | 0.575965 | 0.671443 | 0.656283 | 33.803 |
+
+NFD-neighbor minus equal averaging was -0.005741, -0.008041 and -0.004277
+for the three mAP metrics. Its code differed from equal averaging on 13.4% of
+validation images and 10.66% of database images, so the failure was not an
+inactive branch. The descriptive paired bootstrap intervals for these three
+deltas were entirely negative, but the validation set had selected the frozen
+checkpoint and these are not independent confirmatory intervals.
+
+**Decision: stop this candidate.** It fails the registered equal-fusion gate
+on all three metrics. Do not run a final-query evaluation, new seeds, or a
+parameter search for this formulation. Equal two-view averaging remains a
+useful engineering control, not a substantiated third innovation.
