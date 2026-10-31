@@ -186,6 +186,7 @@ one-view encoding, code length and ordinary Hamming ranking remain unchanged.
 
 Keep seed=60 and rho=0.05 fixed for any planned 16/64-bit transfer evaluation;
 use each bit length's matching B1/NFD artifacts and validation-based selection.
-The current screen launcher accepts only 32-bit references, so do not assume it
-already supports those runs. Record any future method proposed after seeing
+At the time of this result, the screen launcher accepted only 32-bit references.
+The subsequent tested transfer entry is documented in I3_NFD_SAM_TRANSFER.md.
+Record any future method proposed after seeing
 these query results as further development, not as an untouched blind test.

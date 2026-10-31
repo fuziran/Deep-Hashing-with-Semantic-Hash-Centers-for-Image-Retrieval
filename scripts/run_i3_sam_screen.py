@@ -1,4 +1,4 @@
-"""Fixed 32-bit seed-60 NFD versus ordinary SAM control; validation only."""
+"""Fixed seed-60 NFD versus ordinary SAM control at 16/32/64 bits; validation only."""
 import argparse
 import csv
 import json
@@ -23,13 +23,13 @@ METRICS = ("mAP@ALL", "mAP@100", "mAP@1000")
 def build_plan(path, config, root, gpu=0, data_root=None):
     if (config.get("variant") != "b2nfd" or config.get("paired_stage_seeds") is not True
             or config.get("dataset") != "cifar-100-new-seg"
-            or config.get("code_length") != 32 or config.get("seed") != 60
+            or config.get("code_length") not in (16, 32, 64) or config.get("seed") != 60
             or config.get("epoch") != 300 or config.get("num_classes") != 100
             or config.get("non_deterministic") is not False
             or config.get("nfd_alpha") != .75 or config.get("nfd_weight") != .01
             or config.get("nfd_topk") != 5 or config.get("nfd_warmup") != 20
             or config.get("nfd_ramp_end") != 40 or config.get("sam_rho", 0) != 0):
-        raise ValueError("Expected the original deterministic 32-bit seed-60, 300-epoch B1+NFD reference")
+        raise ValueError("Expected an original deterministic 16/32/64-bit seed-60, 300-epoch B1+NFD reference")
     for key in SHARED + ARTIFACTS + ("root", "topK", "split_hash"):
         if key not in config:
             raise ValueError(f"Missing reference field: {key}")
@@ -52,7 +52,7 @@ def build_plan(path, config, root, gpu=0, data_root=None):
             for mode, rho in (("control", 0.), ("sam", RHO))]
 
 
-def reference_data_identity(path, config, reference_audit=None):
+def reference_data_identity(path, config, reference_audit=None, dataset_anchor_run=None):
     """Bind a legacy manifest to an existing checkpoint-specific dataset audit.
 
     Never fill the expected fingerprint from the data currently being checked.
@@ -60,6 +60,24 @@ def reference_data_identity(path, config, reference_audit=None):
     """
     from utils.experiment import file_sha256
     expected = config.get("dataset_content_sha256")
+    if dataset_anchor_run:
+        if reference_audit:
+            raise ValueError("Choose either --reference-audit or --dataset-anchor-run")
+        from scripts.evaluate_query import validate_run
+        anchor = Path(dataset_anchor_run).resolve()
+        anchor_config, _, _, receipt = validate_run(anchor)
+        if (anchor_config.get("variant") != "b2nfd" or anchor_config.get("code_length") != 32
+                or anchor_config.get("sam_rho", 0) != 0):
+            raise ValueError("Dataset anchor must be the completed ordinary 32-bit NFD control")
+        for field in ("dataset", "seed", "num_classes", "val_per_class", "split_hash"):
+            if anchor_config.get(field) != config.get(field):
+                raise ValueError(f"Dataset anchor protocol mismatch: {field}")
+        digest = anchor_config["dataset_content_sha256"]
+        if expected and expected != digest:
+            raise ValueError("Reference config and dataset anchor fingerprints disagree")
+        return dict(expected_dataset_content_sha256=digest,
+                    dataset_identity_source="completed-paired-32bit-control",
+                    dataset_anchor_run=str(anchor), dataset_anchor_receipt=receipt)
     audit_path = Path(reference_audit).resolve() if reference_audit else None
     if expected and audit_path is None:
         return dict(expected_dataset_content_sha256=expected,
@@ -94,14 +112,14 @@ def reference_data_identity(path, config, reference_audit=None):
                 reference_checkpoint_sha256=audit["checkpoint_sha256"])
 
 
-def preflight(path, config, plan, data_root=None, reference_audit=None):
+def preflight(path, config, plan, data_root=None, reference_audit=None, dataset_anchor_run=None):
     """Validate raw data and frozen parent artifacts, without iterating any loader."""
     import torch
     from data.data_loader import load_data
     from utils.experiment import file_sha256, seed_everything
     from utils.frozen_b1 import load_frozen_b1
     from utils.neighbor_feature_distill import load_nfd
-    identity = reference_data_identity(path, config, reference_audit)
+    identity = reference_data_identity(path, config, reference_audit, dataset_anchor_run)
     args = argparse.Namespace(**config)
     args.variant, args.device = "b2nfd", torch.device("cpu")
     args.root = plan[0]["command"][plan[0]["command"].index("--root") + 1]
@@ -213,7 +231,7 @@ def summarize(root):
                    for row in history):
             raise ValueError("Training pass/update budget mismatch")
         runs[arm["mode"]] = (config, history, start)
-        rows.append(dict(mode=arm["mode"], run_dir=str(run), selected_epoch=metrics["selected_epoch"],
+        rows.append(dict(mode=arm["mode"], code_length=config["code_length"], run_dir=str(run), selected_epoch=metrics["selected_epoch"],
                          completed_epochs=len(history), rho=arm["rho"], query_evaluated=False,
                          epoch_loop_seconds=sum(row["seconds"] for row in history), **validation))
     control, sam = runs["control"], runs["sam"]
@@ -230,7 +248,8 @@ def summarize(root):
     deltas = {key: rows[1][key] - rows[0][key] for key in METRICS}
     reference = plan.get("reference_validation")
     historical_delta = {key: rows[1][key] - reference[key] for key in METRICS} if reference else None
-    report = dict(results=rows, paired_initialization=True, paired_epoch_orders=True,
+    report = dict(code_length=control[0]["code_length"], seed=control[0]["seed"],
+                  results=rows, paired_initialization=True, paired_epoch_orders=True,
                   paired_first_batch_image_checks=True, query_evaluated=False,
                   historical_reference_validation=reference,
                   control_minus_historical_reference={key: rows[0][key] - reference[key] for key in METRICS} if reference else None,
@@ -256,6 +275,7 @@ def main():
     parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument("--data-root")
     parser.add_argument("--reference-audit", help="Existing checkpoint-specific NFD diagnostic.json for a legacy config")
+    parser.add_argument("--dataset-anchor-run", help="Completed 32-bit ordinary NFD control with a verified data fingerprint")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--smoke-test", action="store_true", help="One disposable GPU SAM batch with full NFD, no evaluation")
     parser.add_argument("--report", help="Verify and summarize an already completed paired screen")
@@ -271,7 +291,7 @@ def main():
             raise FileExistsError(f"Choose a new output root: {root}")
         config = read_config(path)
         arms = build_plan(path, config, root, options.gpu, options.data_root)
-        checks = preflight(path, config, arms, options.data_root, options.reference_audit)
+        checks = preflight(path, config, arms, options.data_root, options.reference_audit, options.dataset_anchor_run)
         from utils.experiment import file_sha256, source_sha256
         plan = dict(reference_config=str(path), reference_config_sha256=file_sha256(path),
                     source_sha256=source_sha256(), checks=checks, arms=arms,
