@@ -72,6 +72,9 @@ class TransferTests(unittest.TestCase):
             self.assertEqual([i["bits"] for i in plan["items"]], [16, 64])
             for item, call in zip(plan["items"], preflight.call_args_list):
                 bit = item["bits"]
+                self.assertTrue(plan["sam_only"])
+                self.assertEqual([arm["mode"] for arm in item["arms"]], ["sam"])
+                self.assertIn("--sam-only", item["command"])
                 self.assertEqual(item["reference_config"], str(paths[bit]))
                 self.assertEqual(call.kwargs["dataset_anchor_run"], root / "anchor")
                 for arm in item["arms"]:
@@ -83,6 +86,49 @@ class TransferTests(unittest.TestCase):
                     self.assertEqual(command[command.index("--sam-rho") + 1], "0.05" if arm["mode"] == "sam" else "0.0")
                     self.assertIn("--skip-query", command)
             self.assertFalse(Path(options.output_root).exists())
+
+    def test_historical_query_prefers_saved_query_and_labels_table_fallback(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            paths, _, _ = self.fixture(root)
+            for bit in (16, 64):
+                fallback = transfer.historical_query(paths[bit], bit)
+                self.assertEqual(fallback["source_kind"], "user-reported-query-table")
+                self.assertEqual(fallback["displayed_decimals"], 6)
+                metrics = {key: .55 for key in single.METRICS}
+                saved = paths[bit].parent / "metrics.json"
+                saved.write_text(json.dumps(dict(query_evaluated=False, query_metrics=None, best_validation_mAP=.99)))
+                self.assertEqual(transfer.historical_query(paths[bit], bit)["query_metrics"], transfer.USER_REPORTED_QUERY[bit])
+                saved.write_text(json.dumps(dict(query_evaluated=True, query_metrics=metrics)))
+                reference = transfer.historical_query(paths[bit], bit)
+                self.assertEqual(reference["source_kind"], "saved-query-metrics")
+                self.assertEqual(reference["query_metrics"], metrics)
+                self.assertEqual(reference["source_sha256"], file_sha256(saved))
+
+    def test_sam_only_summary_needs_no_new_control_and_never_claims_pairing(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            paths, configs, _ = self.fixture(root)
+            output = root / "only"
+            output.mkdir()
+            arms = single.build_plan(paths[16], configs[16], output, sam_only=True)
+            (output / "launch_plan.json").write_text(json.dumps(dict(arms=arms, sam_only=True, source_sha256="source",
+                reference_validation={key: .5 for key in single.METRICS})))
+            run = output / "sam" / "runs" / "selected"
+            run.mkdir(parents=True)
+            history = [dict(epoch=e, seconds=1., optimizer_updates=2, student_training_passes=4,
+                            teacher_training_passes=2 if e > 20 else 0) for e in range(1, 301)]
+            (run / "training_history.json").write_text(json.dumps(history))
+            (run / "training_start.json").write_text(json.dumps(dict(batches_per_epoch=2)))
+            config = {**configs[16], "sam_rho": .05, "skip_query": True, "source_sha256": "source"}
+            with patch("scripts.evaluate_query.validate_run", return_value=(config,
+                       {"query_evaluated": False, "selected_epoch": 300}, {key: .51 for key in single.METRICS}, {})):
+                report = single.summarize(output)
+            self.assertEqual(report["comparison"], "historical-reference")
+            self.assertIsNone(report["paired_initialization"])
+            self.assertIsNone(report["sam_minus_control"])
+            self.assertAlmostEqual(report["sam_minus_historical_reference"]["mAP@ALL"], .01)
+            self.assertFalse((output / "control").exists())
 
     def test_ordinary_fd_excluded_and_ambiguous_reference_rejected(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -143,6 +189,7 @@ class TransferTests(unittest.TestCase):
                 with patch("sys.argv", argv), patch.object(transfer, "training_report", return_value={"query_evaluated": False}):
                     transfer.main()
                 self.assertEqual(run.call_count, 2)
+                self.assertTrue(all("--sam-only" in call.args[0] for call in run.call_args_list))
                 self.assertEqual([call.args[0][call.args[0].index("--nfd-config") + 1] for call in run.call_args_list],
                                  [str(root / "16" / "base" / "config.json"), str(root / "64" / "base" / "config.json")])
                 query.assert_not_called()
@@ -210,6 +257,53 @@ class TransferTests(unittest.TestCase):
                 transfer.evaluate_queries(root, 0)
             run.assert_not_called()
             self.assertFalse((root / "query").exists())
+
+    def test_sam_only_query_evaluates_two_new_models_and_reuses_old_scores(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            training, configs = self.query_fixture(root)
+            training["results"] = [row for row in training["results"] if row["mode"] == "sam"]
+            plan = json.loads((root / "transfer_plan.json").read_text())
+            plan["sam_only"] = True
+            for item in plan["items"]:
+                item["historical_query"] = dict(query_metrics=transfer.USER_REPORTED_QUERY[item["bits"]],
+                    source_kind="user-reported-query-table", displayed_decimals=6)
+            (root / "transfer_plan.json").write_text(json.dumps(plan))
+            events = []
+            def dry(options):
+                self.assertTrue(options.dry_run)
+                self.assertIn("sam", Path(options.run_dir).parts)
+                events.append("dry")
+                return {"split_hash": "split", "dataset_content_sha256": "data"}
+            def run(command, log):
+                self.assertEqual(events[:2], ["dry", "dry"])
+                events.append("query")
+                selected = Path(command[command.index("--run-dir") + 1])
+                self.assertIn("sam", selected.parts)
+                destination = Path(command[command.index("--output-dir") + 1])
+                destination.mkdir(parents=True)
+                payload = destination / "retrieval_outputs.pt"
+                payload.write_bytes(b"SAM query outputs")
+                config = configs[selected]
+                report = dict(**config, query_evaluated=True, selected_epoch=300,
+                    counts={"query": 5000, "database": 45000}, checkpoint_sha256="checkpoint",
+                    evaluation_source_sha256=source_sha256(), retrieval_outputs_sha256=file_sha256(payload),
+                    query_metrics={key: .7 for key in single.METRICS})
+                (destination / "metrics.json").write_text(json.dumps(report))
+            with patch.object(transfer, "training_report", return_value=training), \
+                    patch("scripts.evaluate_query.evaluate", side_effect=dry), \
+                    patch("scripts.evaluate_query.validate_run", side_effect=lambda p: (
+                        configs[p], {"selected_epoch": 300}, {}, {"checkpoint_sha256": "checkpoint"})), \
+                    patch.object(transfer, "run_process", side_effect=run), patch("builtins.print"):
+                report = transfer.evaluate_queries(root, 0)
+            self.assertEqual(events, ["dry", "dry", "query", "query"])
+            self.assertEqual(len(report["results"]), 2)
+            self.assertIsNone(report["sam_minus_control"])
+            self.assertEqual(report["comparison"], "historical-reference")
+            self.assertAlmostEqual(report["sam_minus_reference_query"]["16"]["mAP@ALL"], .7 - .541192)
+            self.assertAlmostEqual(report["sam_minus_reference_query"]["64"]["mAP@ALL"], .7 - .598426)
+            self.assertFalse((root / "query" / "16bit" / "control").exists())
+            self.assertFalse((root / "query" / "64bit" / "control").exists())
 
 
 if __name__ == "__main__":

@@ -20,7 +20,7 @@ RHO = .05
 METRICS = ("mAP@ALL", "mAP@100", "mAP@1000")
 
 
-def build_plan(path, config, root, gpu=0, data_root=None):
+def build_plan(path, config, root, gpu=0, data_root=None, sam_only=False):
     if (config.get("variant") != "b2nfd" or config.get("paired_stage_seeds") is not True
             or config.get("dataset") != "cifar-100-new-seg"
             or config.get("code_length") not in (16, 32, 64) or config.get("seed") != 60
@@ -47,9 +47,10 @@ def build_plan(path, config, root, gpu=0, data_root=None):
     for key in ARTIFACTS:
         common += ["--" + key.replace("_", "-"), str(resolve_file(config[key], path))]
     common += ["--root", str(data.resolve()), "--gpu", str(gpu), "--topK", "-1", "100", "1000"]
+    modes = (("sam", RHO),) if sam_only else (("control", 0.), ("sam", RHO))
     return [dict(mode=mode, rho=rho, output=str(root / mode),
                  command=common + ["--sam-rho", str(rho), "--output-dir", str(root / mode)])
-            for mode, rho in (("control", 0.), ("sam", RHO))]
+            for mode, rho in modes]
 
 
 def reference_data_identity(path, config, reference_audit=None, dataset_anchor_run=None):
@@ -209,9 +210,21 @@ def smoke_test(command):
                     note="Disposable smoke model; formal paired runs start fresh and use the complete budget.")
 
 
+def save_summary(root, report):
+    (root / "screen_report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+    with (root / "summary.csv").open("w", encoding="utf-8", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=list(report["results"][0]))
+        writer.writeheader()
+        writer.writerows(report["results"])
+    return report
+
+
 def summarize(root):
     from scripts.evaluate_query import validate_run
     plan = read_config(root / "launch_plan.json")
+    sam_only = plan.get("sam_only", False)
+    if [arm["mode"] for arm in plan["arms"]] != (["sam"] if sam_only else ["control", "sam"]):
+        raise ValueError("Planned training arms do not match the comparison mode")
     rows, runs = [], {}
     for arm in plan["arms"]:
         folders = [p for p in (Path(arm["output"]) / "runs").iterdir() if p.is_dir()]
@@ -234,6 +247,16 @@ def summarize(root):
         rows.append(dict(mode=arm["mode"], code_length=config["code_length"], run_dir=str(run), selected_epoch=metrics["selected_epoch"],
                          completed_epochs=len(history), rho=arm["rho"], query_evaluated=False,
                          epoch_loop_seconds=sum(row["seconds"] for row in history), **validation))
+    if sam_only:
+        reference = plan["reference_validation"]
+        deltas = {key: rows[0][key] - reference[key] for key in METRICS}
+        return save_summary(root, dict(code_length=runs["sam"][0]["code_length"], seed=60,
+            results=rows, comparison="historical-reference", query_evaluated=False,
+            historical_reference_validation=reference, sam_minus_historical_reference=deltas,
+            sam_minus_control=None, paired_initialization=None, paired_epoch_orders=None,
+            paired_first_batch_image_checks=None,
+            development_gate_passed=deltas["mAP@ALL"] >= .005 and all(deltas[k] >= 0 for k in METRICS),
+            note="SAM-only training; the original NFD reference is reused, not retrained. No newly paired control or query evaluation is implied."))
     control, sam = runs["control"], runs["sam"]
     if control[2]["initial_state_sha256"] != sam[2]["initial_state_sha256"]:
         raise ValueError("Paired initialization mismatch")
@@ -260,12 +283,7 @@ def summarize(root):
                                                 historical_delta["mAP@ALL"] >= .005 and
                                                 all(historical_delta[k] >= 0 for k in METRICS))),
                   note="Existing-method direction screen, not innovation 3. Epochs and updates match; SAM uses twice the student passes. Same selection validation, no independent confirmation or causal flatness claim.")
-    (root / "screen_report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
-    with (root / "summary.csv").open("w", encoding="utf-8", newline="") as stream:
-        writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
-        writer.writeheader()
-        writer.writerows(rows)
-    return report
+    return save_summary(root, report)
 
 
 def main():
@@ -278,6 +296,7 @@ def main():
     parser.add_argument("--dataset-anchor-run", help="Completed 32-bit ordinary NFD control with a verified data fingerprint")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--smoke-test", action="store_true", help="One disposable GPU SAM batch with full NFD, no evaluation")
+    parser.add_argument("--sam-only", action="store_true", help="Train only SAM, reusing the historical NFD reference")
     parser.add_argument("--report", help="Verify and summarize an already completed paired screen")
     options = parser.parse_args()
     try:
@@ -290,11 +309,11 @@ def main():
         if root.exists():
             raise FileExistsError(f"Choose a new output root: {root}")
         config = read_config(path)
-        arms = build_plan(path, config, root, options.gpu, options.data_root)
+        arms = build_plan(path, config, root, options.gpu, options.data_root, sam_only=options.sam_only)
         checks = preflight(path, config, arms, options.data_root, options.reference_audit, options.dataset_anchor_run)
         from utils.experiment import file_sha256, source_sha256
         plan = dict(reference_config=str(path), reference_config_sha256=file_sha256(path),
-                    source_sha256=source_sha256(), checks=checks, arms=arms,
+                    source_sha256=source_sha256(), checks=checks, arms=arms, sam_only=options.sam_only,
                     reference_validation=reference_validation(path))
         for arm in arms:
             print(f"{arm['mode']}: {shlex.join(arm['command'])}", flush=True)
@@ -307,7 +326,7 @@ def main():
         if not checks["cuda_available"]:
             raise ValueError("CUDA is unavailable; real screen requires the original SHC GPU environment")
         if options.smoke_test:
-            print(json.dumps(smoke_test(arms[1]["command"]), indent=2), flush=True)
+            print(json.dumps(smoke_test(next(arm for arm in arms if arm["mode"] == "sam")["command"]), indent=2), flush=True)
             return
         root.mkdir(parents=True, exist_ok=False)
         (root / "launch_plan.json").write_text(json.dumps(plan, indent=2), encoding="utf-8")
@@ -316,7 +335,7 @@ def main():
             if (source_sha256() != plan["source_sha256"] or file_sha256(path) != plan["reference_config_sha256"]
                     or file_sha256(checks["initialization_file"]) != checks["initialization_sha256"]):
                 raise ValueError("Source, reference config or initialization changed after preflight")
-            print(f"{index}/2 Starting {arm['mode']}; detailed log: {root / (arm['mode'] + '.log')}", flush=True)
+            print(f"{index}/{len(arms)} Starting {arm['mode']}; detailed log: {root / (arm['mode'] + '.log')}", flush=True)
             started = time.monotonic()
             with (root / (arm["mode"] + ".log")).open("w", encoding="utf-8") as log:
                 subprocess.run(arm["command"], cwd=REPO, stdout=log, stderr=subprocess.STDOUT,
@@ -324,7 +343,7 @@ def main():
             completed.append(dict(mode=arm["mode"], wall_seconds=time.monotonic() - started))
             (root / "completed_arms.json").write_text(json.dumps(completed, indent=2), encoding="utf-8")
         print(json.dumps(summarize(root), indent=2), flush=True)
-        print("Both runs completed. Report: " + str(root / "screen_report.json"), flush=True)
+        print("Requested training runs completed. Report: " + str(root / "screen_report.json"), flush=True)
     except (OSError, ValueError, KeyError, TypeError, subprocess.CalledProcessError) as error:
         parser.exit(1, f"SAM screen failed: {error}\n")
 

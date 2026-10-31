@@ -190,3 +190,8 @@ At the time of this result, the screen launcher accepted only 32-bit references.
 The subsequent tested transfer entry is documented in I3_NFD_SAM_TRANSFER.md.
 Record any future method proposed after seeing
 these query results as further development, not as an untouched blind test.
+
+The user subsequently declined retraining the existing 16/64-bit ordinary NFD
+controls. The transfer default now trains and evaluates only the two SAM models,
+with explicitly labeled historical controls. The single-length --sam-only option
+records this comparison mode and leaves new-pairing checks null rather than true.

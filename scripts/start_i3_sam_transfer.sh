@@ -11,8 +11,8 @@ if [[ ! -d "$BASELINE_ROOT" || ! -f "$ANCHOR_RUN/config.json" || ! "$GPU" =~ ^[0
 fi
 mkdir -p logs tmp
 STAMP="$(date +%Y%m%d_%H%M%S)_$$"
-TRANSFER_ROOT="$REPO_ROOT/save/i3_sam_transfer16_64_seed60_$STAMP"
-TRANSFER_LOG="$REPO_ROOT/logs/i3_sam_transfer16_64_seed60_$STAMP.log"
+TRANSFER_ROOT="$REPO_ROOT/save/i3_sam_only16_64_seed60_$STAMP"
+TRANSFER_LOG="$REPO_ROOT/logs/i3_sam_only16_64_seed60_$STAMP.log"
 echo "1/4 检查原 SHC 环境并运行 SAM/NFD/迁移测试"
 conda run --no-capture-output -n SHC python -u -c \
   'import sys,torch; i=int(sys.argv[1]); assert torch.cuda.is_available(), "CUDA 不可用"; print(torch.__version__,torch.cuda.get_device_name(i)); print((torch.ones(1,device="cuda:"+str(i))+1).item())' "$GPU"
@@ -24,7 +24,7 @@ echo "2/4 检查两个码长各自的配置和缓存，以及共同的数据身�
 conda run --no-capture-output -n SHC python -u "${ARGS[@]}" --dry-run
 echo "3/4 分别运行16bit和64bit临时GPU批次检查"
 conda run --no-capture-output -n SHC python -u "${ARGS[@]}" --smoke-test
-echo "4/4 后台顺序启动16bit control -> sam -> 64bit control -> sam，各300轮"
+echo "4/4 后台只启动16bit SAM -> 64bit SAM，各300轮；原NFD对照不重跑"
 printf '%s\n' "$TRANSFER_ROOT" > logs/i3_sam_transfer_latest.path
 printf '%s\n' "$TRANSFER_LOG" > logs/i3_sam_transfer_latest.log_path
 nohup conda run --no-capture-output -n SHC python -u "${ARGS[@]}" \
