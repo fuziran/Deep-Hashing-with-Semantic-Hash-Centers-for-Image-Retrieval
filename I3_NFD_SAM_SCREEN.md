@@ -154,3 +154,38 @@ change the split and violate the frozen parent cache protocol. An explicit
 hash-stage seed must be introduced and tested before launching those repeats.
 Any later hash-specific candidate must beat ordinary SAM and account for its
 extra compute; final query remains reserved for a frozen protocol.
+
+## User-frozen seed-60 query evaluation (user-reported)
+
+The user explicitly chose to keep seed=60 rather than add training-seed repeats,
+and authorized evaluating the already selected 32-bit control and SAM models.
+This supersedes the earlier proposed repeat-before-query sequence. Additional
+seeds are not a prerequisite for the user's chosen single-seed experiment.
+Both selected models were epoch 300; rho remained 0.05. The returned evaluation
+counts were 5,000 query images against 45,000 database images for both arms.
+
+| Method | Query mAP@ALL | Query mAP@100 | Query mAP@1000 |
+| --- | ---: | ---: | ---: |
+| B1+NFD control | 0.583456 | 0.688053 | 0.665630 |
+| B1+NFD + ordinary SAM | 0.607899 | 0.706845 | 0.686009 |
+| Reported SAM minus control | +0.024443 | +0.018792 | +0.020378 |
+
+Values and deltas are transcribed at the terminal's displayed precision; the
+delta was calculated from unrounded metrics. Do not reconstruct extra precision
+from the rounded rows. The reported gains are 2.444, 1.879 and 2.038 percentage
+points. The control reproduced the CIFAR-100 32-bit B1+NFD query row in the
+user's innovation-one document. The local checkout did not independently load
+the remote evaluation artifacts.
+
+**Decision: preserve B1+NFD+SAM as an empirically positive single-seed 32-bit
+configuration.** The result supports further work on the training-generalization
+direction under this protocol. It is not an original SAM algorithm, multi-seed
+evidence, or a causal demonstration that sharpness produced the improvement.
+Training-loop cost remains about 2.148x the control; inference architecture,
+one-view encoding, code length and ordinary Hamming ranking remain unchanged.
+
+Keep seed=60 and rho=0.05 fixed for any planned 16/64-bit transfer evaluation;
+use each bit length's matching B1/NFD artifacts and validation-based selection.
+The current screen launcher accepts only 32-bit references, so do not assume it
+already supports those runs. Record any future method proposed after seeing
+these query results as further development, not as an untouched blind test.
