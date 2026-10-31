@@ -103,3 +103,21 @@ exists for that purpose; local tests do not establish an improvement.
 Local verification: 41 tests passed (11 SAM, 8 NFD, plus baseline/query regression
 checks) on Windows with PyTorch 2.14.0+cpu; the Bash starter passed `bash -n`.
 No real CIFAR-100 training or GPU smoke test was run on this workstation.
+
+## Historical NFD manifests
+
+Some original NFD config.json files predate the dataset_content_sha256 field.
+The launcher accepts those without modifying them. It obtains the expected pixel/
+label digest from the existing NFD bottleneck diagnostic.json, checking its
+checkpoint SHA256, training-source SHA256, split, variant, bit length and seed
+against the reference. The current raw data is still independently fingerprinted
+and must match that report. A digest is never taken from the current data and
+treated as its own historical verification.
+
+By default the historical report is resolved through
+logs/i3_bottleneck_latest.path -> nfd/diagnostic.json. Alternatively supply
+--reference-audit FILE to the Python launcher, or FILE as the third argument to
+start_i3_sam_screen.sh. Missing or mismatched historical evidence stops preflight.
+The chosen report path/hash and expected data identity are recorded in the plan.
+The compatibility fix passed 22 SAM/NFD CPU tests, including three additional
+legacy-manifest tests for lookup, identity rejection and actual-data comparison.

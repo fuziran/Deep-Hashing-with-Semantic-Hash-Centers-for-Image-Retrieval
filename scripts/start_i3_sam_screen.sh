@@ -6,6 +6,7 @@ REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 NFD_CONFIG="${1:-$REPO_ROOT/save_nfd_seed60_bINBuclZ/nfd/runs/cifar-100-new-seg_B2NFD_32bit_seed60_639b7ea1eaa3/config.json}"
 GPU="${2:-0}"
+REFERENCE_AUDIT="${3:-}"
 if ! command -v conda >/dev/null 2>&1; then
   echo "conda 不在当前 PATH 中；请先打开可使用 conda 的终端。" >&2
   exit 1
@@ -29,6 +30,9 @@ conda run --no-capture-output -n SHC python -m unittest \
 
 ARGS=(scripts/run_i3_sam_screen.py --nfd-config "$NFD_CONFIG" \
       --output-root "$SCREEN_ROOT" --gpu "$GPU")
+if [[ -n "$REFERENCE_AUDIT" ]]; then
+  ARGS+=(--reference-audit "$REFERENCE_AUDIT")
+fi
 echo "3/5 检查原始数据、B1 缓存和训练设置"
 conda run --no-capture-output -n SHC python -u "${ARGS[@]}" --dry-run
 

@@ -30,7 +30,7 @@ def build_plan(path, config, root, gpu=0, data_root=None):
             or config.get("nfd_topk") != 5 or config.get("nfd_warmup") != 20
             or config.get("nfd_ramp_end") != 40 or config.get("sam_rho", 0) != 0):
         raise ValueError("Expected the original deterministic 32-bit seed-60, 300-epoch B1+NFD reference")
-    for key in SHARED + ARTIFACTS + ("root", "topK", "split_hash", "dataset_content_sha256"):
+    for key in SHARED + ARTIFACTS + ("root", "topK", "split_hash"):
         if key not in config:
             raise ValueError(f"Missing reference field: {key}")
     if config["topK"] != [-1, 100, 1000]:
@@ -52,13 +52,56 @@ def build_plan(path, config, root, gpu=0, data_root=None):
             for mode, rho in (("control", 0.), ("sam", RHO))]
 
 
-def preflight(path, config, plan, data_root=None):
+def reference_data_identity(path, config, reference_audit=None):
+    """Bind a legacy manifest to an existing checkpoint-specific dataset audit.
+
+    Never fill the expected fingerprint from the data currently being checked.
+    Historical manifests are left unchanged; no scores select an audit.
+    """
+    from utils.experiment import file_sha256
+    expected = config.get("dataset_content_sha256")
+    audit_path = Path(reference_audit).resolve() if reference_audit else None
+    if expected and audit_path is None:
+        return dict(expected_dataset_content_sha256=expected,
+                    dataset_identity_source="reference-config")
+    if audit_path is None:
+        pointer = REPO / "logs" / "i3_bottleneck_latest.path"
+        if pointer.is_file():
+            folder = Path(pointer.read_text(encoding="utf-8").strip())
+            if not folder.is_absolute():
+                folder = REPO / folder
+            audit_path = (folder / "nfd" / "diagnostic.json").resolve()
+    if audit_path is None or not audit_path.is_file():
+        raise ValueError("Legacy NFD config has no dataset_content_sha256. Supply --reference-audit "
+                         "with the existing NFD bottleneck diagnostic.json, or restore "
+                         "logs/i3_bottleneck_latest.path; do not edit the original config.")
+    audit = read_config(audit_path)
+    checkpoint = path.parent / "best_model_state.pt"
+    for field, value in (("variant", "b2nfd"), ("code_length", config["code_length"]),
+                         ("seed", config["seed"]), ("split_hash", config["split_hash"]),
+                         ("training_source_sha256", config["source_sha256"]),
+                         ("checkpoint_sha256", file_sha256(checkpoint))):
+        if not value or audit.get(field) != value:
+            raise ValueError(f"Reference audit identity mismatch: {field}")
+    digest = audit.get("dataset_content_sha256")
+    if not isinstance(digest, str) or not digest:
+        raise ValueError("Reference audit is missing dataset_content_sha256")
+    if expected and digest != expected:
+        raise ValueError("Reference config and audit dataset fingerprints disagree")
+    return dict(expected_dataset_content_sha256=digest,
+                dataset_identity_source="checkpoint-specific-bottleneck-audit",
+                reference_audit=str(audit_path), reference_audit_sha256=file_sha256(audit_path),
+                reference_checkpoint_sha256=audit["checkpoint_sha256"])
+
+
+def preflight(path, config, plan, data_root=None, reference_audit=None):
     """Validate raw data and frozen parent artifacts, without iterating any loader."""
     import torch
     from data.data_loader import load_data
     from utils.experiment import file_sha256, seed_everything
     from utils.frozen_b1 import load_frozen_b1
     from utils.neighbor_feature_distill import load_nfd
+    identity = reference_data_identity(path, config, reference_audit)
     args = argparse.Namespace(**config)
     args.variant, args.device = "b2nfd", torch.device("cpu")
     args.root = plan[0]["command"][plan[0]["command"].index("--root") + 1]
@@ -70,7 +113,7 @@ def preflight(path, config, plan, data_root=None):
         loaders = load_data(args)
         del loaders  # No training, validation, final-query or database iteration.
         if (args.split_hash != config["split_hash"]
-                or args.dataset_content_sha256 != config["dataset_content_sha256"]):
+                or args.dataset_content_sha256 != identity["expected_dataset_content_sha256"]):
             raise ValueError("Reference dataset pixels/labels or split mismatch")
         load_frozen_b1(args)
         module = load_nfd(args)
@@ -85,6 +128,7 @@ def preflight(path, config, plan, data_root=None):
     if not weights.is_file():
         raise FileNotFoundError("Existing resnet34-b627a593.pth is required in models_ckpt or torch hub cache")
     return dict(split_hash=args.split_hash, dataset_content_sha256=args.dataset_content_sha256,
+                **identity,
                 initialization_file=str(weights.resolve()), initialization_sha256=file_sha256(weights),
                 teacher_sha256=args.nfd_teacher_sha256, basis_sha256=args.nfd_basis_sha256,
                 cuda_available=torch.cuda.is_available(), loaders_iterated=False)
@@ -211,6 +255,7 @@ def main():
     parser.add_argument("--output-root")
     parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument("--data-root")
+    parser.add_argument("--reference-audit", help="Existing checkpoint-specific NFD diagnostic.json for a legacy config")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--smoke-test", action="store_true", help="One disposable GPU SAM batch with full NFD, no evaluation")
     parser.add_argument("--report", help="Verify and summarize an already completed paired screen")
@@ -226,7 +271,7 @@ def main():
             raise FileExistsError(f"Choose a new output root: {root}")
         config = read_config(path)
         arms = build_plan(path, config, root, options.gpu, options.data_root)
-        checks = preflight(path, config, arms, options.data_root)
+        checks = preflight(path, config, arms, options.data_root, options.reference_audit)
         from utils.experiment import file_sha256, source_sha256
         plan = dict(reference_config=str(path), reference_config_sha256=file_sha256(path),
                     source_sha256=source_sha256(), checks=checks, arms=arms,

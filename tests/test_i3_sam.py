@@ -300,6 +300,80 @@ class LauncherTests(unittest.TestCase):
             self.assertFalse(result["loaders_iterated"])
             self.assertEqual(result["split_hash"], "split")
 
+    def legacy_fixture(self, root):
+        from utils.experiment import file_sha256
+        path, config = self.fixture(root)
+        del config["dataset_content_sha256"]
+        config["source_sha256"] = "historical-source"
+        path.write_text(json.dumps(config))
+        checkpoint = path.parent / "best_model_state.pt"
+        checkpoint.write_bytes(b"historical checkpoint")
+        audit = dict(variant="b2nfd", code_length=32, seed=60, split_hash="split",
+                     training_source_sha256="historical-source",
+                     checkpoint_sha256=file_sha256(checkpoint), dataset_content_sha256="data")
+        audit_path = root / "audit" / "nfd" / "diagnostic.json"
+        audit_path.parent.mkdir(parents=True)
+        audit_path.write_text(json.dumps(audit))
+        return path, config, audit_path, audit
+
+    def test_legacy_audit_lookup_binds_checkpoint_without_editing_config(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            path, config, audit_path, _ = self.legacy_fixture(root)
+            original = path.read_bytes()
+            launch.build_plan(path, config, root / "out")
+            (root / "logs").mkdir()
+            (root / "logs" / "i3_bottleneck_latest.path").write_text(str(audit_path.parent.parent))
+            with patch.object(launch, "REPO", root):
+                identity = launch.reference_data_identity(path, config)
+            self.assertEqual(identity["expected_dataset_content_sha256"], "data")
+            self.assertEqual(identity["reference_audit"], str(audit_path.resolve()))
+            self.assertEqual(original, path.read_bytes())
+
+    def test_legacy_audit_missing_wrong_identity_and_conflicting_digest_are_rejected(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            path, config, audit_path, audit = self.legacy_fixture(root)
+            with patch.object(launch, "REPO", root), self.assertRaisesRegex(ValueError, "reference-audit"):
+                launch.reference_data_identity(path, config)
+            for field in ("variant", "seed", "code_length", "split_hash", "training_source_sha256", "checkpoint_sha256"):
+                with self.subTest(field=field):
+                    audit_path.write_text(json.dumps({**audit, field: "wrong"}))
+                    with self.assertRaisesRegex(ValueError, field):
+                        launch.reference_data_identity(path, config, audit_path)
+            audit_path.write_text(json.dumps(audit))
+            with self.assertRaisesRegex(ValueError, "disagree"):
+                launch.reference_data_identity(path, {**config, "dataset_content_sha256": "other"}, audit_path)
+
+    def test_legacy_preflight_recomputes_and_checks_audited_dataset_digest(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            path, config, audit_path, _ = self.legacy_fixture(root)
+            original = path.read_bytes()
+            arms = launch.build_plan(path, config, root / "out")
+            checkpoint = root / "hub" / "checkpoints" / "resnet34-b627a593.pth"
+            checkpoint.parent.mkdir(parents=True)
+            checkpoint.write_bytes(b"synthetic initialization")
+            class Forbidden:
+                def __iter__(self):
+                    raise AssertionError("Preflight must never iterate loaders")
+            for digest in ("data", "changed-pixels"):
+                def load_data(args):
+                    args.dataset_content_sha256 = digest
+                    return tuple(Forbidden() for _ in range(9))
+                with patch("data.data_loader.load_data", side_effect=load_data), \
+                        patch("utils.frozen_b1.load_frozen_b1") as parent, \
+                        patch("utils.neighbor_feature_distill.load_nfd"), \
+                        patch("torch.hub.get_dir", return_value=str(root / "hub")):
+                    if digest == "data":
+                        result = launch.preflight(path, config, arms, reference_audit=audit_path)
+                        self.assertEqual(result["dataset_identity_source"], "checkpoint-specific-bottleneck-audit")
+                    else:
+                        with self.assertRaisesRegex(ValueError, "pixels/labels"):
+                            launch.preflight(path, config, arms, reference_audit=audit_path)
+                        parent.assert_not_called()
+            self.assertEqual(original, path.read_bytes())
+
     def test_summary_budget_pairing_and_mismatch_rejection(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
