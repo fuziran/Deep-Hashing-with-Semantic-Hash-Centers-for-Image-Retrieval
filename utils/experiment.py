@@ -71,6 +71,7 @@ def source_sha256():
         "utils/semantic_mixup.py", "utils/semantic_rank.py", "utils/rank_checkpoint.py",
         "utils/neighbor_feature_distill.py", "utils/neighborhood_protected_augmentation.py", "utils/foundation_distill.py",
         "utils/neighborhood_view_consistency.py",
+        "utils/sam_nfd.py",
     ):
         digest.update(relative.encode())
         # A checkout on Linux/Windows should have the same source identity.

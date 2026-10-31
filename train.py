@@ -1,4 +1,5 @@
 import copy
+import hashlib
 import json
 import os
 import random
@@ -197,6 +198,18 @@ def train_val(
             and args.npa_rho > 0 and npa is None):
         raise ValueError("Enabled NPA requires prepared training-only statistics")
     net = args.net(bit).to(args.device)
+    sam_rho = getattr(args, "sam_rho", 0.)
+    if sam_rho > 0 and (getattr(args, "variant", None) != "b2nfd"
+                        or nfd is None or not getattr(args, "skip_query", False)):
+        raise ValueError("SAM is restricted to validation-only paired NFD")
+    audit_sam = getattr(args, "sam_version", None) is not None
+    if audit_sam:
+        from utils.reliable_relation import state_sha256
+        os.makedirs(args.run_dir, exist_ok=True)
+        with open(os.path.join(args.run_dir, "training_start.json"), "w", encoding="utf-8") as stream:
+            json.dump(dict(initial_state_sha256=state_sha256(net.state_dict()),
+                           sam_rho=sam_rho, base_optimizer="RMSprop",
+                           epoch_budget=args.epoch, batches_per_epoch=len(train_loader)), stream, indent=2)
     if fcd is not None and getattr(args,'variant','b0') != 'b3fcd':
         raise ValueError('FCD requires b3fcd')
     if getattr(args,'variant','b0') == 'b3fcd' and args.fcd_weight > 0 and fcd is None:
@@ -255,6 +268,8 @@ def train_val(
         if ranker is not None:
             ranker.reset_diagnostics()
         gradient_sample = {}
+        order_digest = hashlib.sha256()
+        first_images_digest = None
         for batch_index, batch in enumerate(train_loader):
             if getattr(args, "variant", "b0") == "b3nvc":
                 if len(batch) != 4:
@@ -263,6 +278,11 @@ def train_val(
                 strong_images = strong_images.to(args.device, non_blocking=True)
             else:
                 images, labels, indices = batch
+            if audit_sam:
+                from utils.reliable_relation import tensor_sha256
+                order_digest.update(torch.as_tensor(indices).cpu().numpy().tobytes())
+                if batch_index == 0:
+                    first_images_digest = tensor_sha256(images[:2])
             images = images.to(args.device, non_blocking=True)
             labels = labels.to(args.device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
@@ -276,6 +296,17 @@ def train_val(
                 from utils.neighborhood_protected_augmentation import npa_weight
                 npa_strength = npa_weight(epoch + 1, args.npa_weight,
                                           args.npa_warmup, args.npa_ramp_end)
+            if sam_rho > 0:
+                from utils.sam_nfd import sam_nfd_step
+                batch_loss, sample = sam_nfd_step(
+                    net, optimizer, criterion, nfd, images, labels, indices, args,
+                    nfd_strength, sample_gradients=batch_index == 0)
+                if batch_index == 0:
+                    gradient_sample = sample
+                total_loss += batch_loss
+                for key, value in criterion.components.items():
+                    component_totals[key] = component_totals.get(key, 0.) + value
+                continue
             if nfd_strength > 0 or npa_strength > 0:
                 output, features = net.forward_with_features(images)
             else:
@@ -431,6 +462,12 @@ def train_val(
         }
         record.update({key: value / max(len(train_loader), 1)
                        for key, value in component_totals.items()})
+        if audit_sam:
+            record.update(train_order_sha256=order_digest.hexdigest(),
+                          first_batch_images_sha256=first_images_digest,
+                          optimizer_updates=len(train_loader),
+                          student_training_passes=len(train_loader) * (2 if sam_rho > 0 else 1),
+                          teacher_training_passes=len(train_loader) if nfd_strength > 0 else 0)
         if mixer is not None:
             record.update(gradient_sample)
             diagnostics_dir = os.path.join(args.run_dir, "mix_diagnostics")

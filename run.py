@@ -119,6 +119,8 @@ def load_config():
     parser.add_argument("--nfd-topk", type=int, default=5)
     parser.add_argument("--nfd-warmup", type=int, default=20)
     parser.add_argument("--nfd-ramp-end", type=int, default=40)
+    parser.add_argument("--sam-rho", type=float, default=0.,
+                        help="Non-adaptive L2 SAM radius for paired validation-only b2nfd; 0 preserves ordinary training.")
     parser.add_argument("--rgnfd-mode", choices=("gated", "mean", "fixed"), default="gated",
                         help="I3 reliability gate, batch-mean alpha control, or fixed NFD control.")
     parser.add_argument("--rgnfd-gate-diagnostic", default=None,
@@ -150,6 +152,14 @@ def load_config():
     parser.add_argument("--fcd-exploratory-diagnostic", default=None,
                         help="Audited direct-logit report for a validation-only pilot after the original teacher gate failed.")
     args = parser.parse_args()
+    if not math.isfinite(args.sam_rho) or args.sam_rho < 0:
+        parser.error("SAM rho must be finite and nonnegative")
+    if args.sam_rho > 0 and (args.variant != "b2nfd" or not args.skip_query):
+        parser.error("SAM screen requires --variant b2nfd and --skip-query")
+    if args.variant == "b2nfd":
+        from utils.sam_nfd import VERSION as SAM_VERSION
+        args.sam_version = SAM_VERSION
+        args.sam_policy = "L2-nonadaptive-all-student-parameters; same-input-RNG; first-pass-BN; one-teacher-forward"
     if args.variant == "b3fcd":
         from utils.foundation_distill import VERSION, ramp
         try:
@@ -417,6 +427,9 @@ def main():
     fcd = None
     if args.skip_query:
         run_config["skip_query"] = True
+    if args.variant == "b2nfd":
+        run_config["sam"] = {"version": args.sam_version, "rho": args.sam_rho,
+                             "policy": args.sam_policy}
     if args.variant in ("b2", "b2r", "b2m", "b2sbr", "b2nfd", "b3npa", "b3fcd", "b3rnd", "b3nvc"):
         from utils.frozen_b1 import load_frozen_b1
         similarity, centers = load_frozen_b1(args)
