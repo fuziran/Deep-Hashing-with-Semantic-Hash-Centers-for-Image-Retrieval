@@ -121,3 +121,36 @@ start_i3_sam_screen.sh. Missing or mismatched historical evidence stops prefligh
 The chosen report path/hash and expected data identity are recorded in the plan.
 The compatibility fix passed 22 SAM/NFD CPU tests, including three additional
 legacy-manifest tests for lookup, identity rejection and actual-data comparison.
+
+## Completed seed-60 direction screen (user-reported)
+
+The user returned the remote report for
+save/i3_sam_screen32_seed60_20261031_142135_706. Both arms completed 300 epochs,
+selected epoch 300 by validation mAP@ALL, and skipped final query. The report
+passed initialization, epoch-order and sampled augmented-image pairing checks.
+The local checkout did not independently read the remote model/report files.
+
+| Method | mAP@ALL | mAP@100 | mAP@1000 | Epoch-loop seconds |
+| --- | ---: | ---: | ---: | ---: |
+| Fresh B1+NFD control | 0.5677513634 | 0.6687548945 | 0.6479442334 | 4817.642 |
+| B1+NFD + ordinary SAM, rho=0.05 | 0.5859671046 | 0.6825764238 | 0.6605279599 | 10348.372 |
+| SAM minus control | +0.0182157412 | +0.0138215293 | +0.0125837265 | |
+
+The fresh control exactly reproduced all three historical validation scores.
+The gains are 1.8216, 1.3822 and 1.2584 percentage points. Epoch-loop time was
+about 80.29 versus 172.47 minutes, a 2.148x ratio. That history field excludes
+validation and setup time, so it is not total end-to-end runtime.
+
+**Decision: the fixed development gate passed; preserve rho=0.05 and treat
+ordinary SAM as a promising strong control.** This single familiar-validation
+result establishes neither independent confirmation nor a hash-specific novelty
+or flatness mechanism. Do not search more radii on this split or label the
+existing SAM algorithm innovation three. Follow-up should first check paired
+training-randomness repeats with frozen settings. Keep split/teacher/centers
+fixed for that experiment and report its scope accurately: training-seed repeats
+are not new data splits or independent held-out confirmation. The current --seed
+controls both data splitting and hash-stage RNG; changing it directly would
+change the split and violate the frozen parent cache protocol. An explicit
+hash-stage seed must be introduced and tested before launching those repeats.
+Any later hash-specific candidate must beat ordinary SAM and account for its
+extra compute; final query remains reserved for a frozen protocol.
