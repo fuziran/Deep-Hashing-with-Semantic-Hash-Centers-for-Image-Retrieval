@@ -106,3 +106,43 @@ query scoring have not been run on this workstation.
 Additional coverage verifies SAM-only command dispatch, no control directory or
 control query creation, historical-result provenance and absence of false pairing
 claims in the single-arm report.
+
+## Completed 16/64-bit query transfer (user-reported 2026-11-01)
+
+The user returned the query report for
+save/i3_sam_only16_64_seed60_20261031_210100_16097. Only the two SAM models
+were newly trained/evaluated. The 16-bit validation selection was epoch 270,
+and the 64-bit selection epoch 300. Both query evaluations used 5,000 images
+against 45,000 database images, with seed=60 and rho=0.05 unchanged.
+
+| Bits | Method | Query mAP@ALL | Query mAP@100 | Query mAP@1000 |
+| --- | --- | ---: | ---: | ---: |
+| 16 | Historical B1+NFD | 0.5411921655 | 0.6588297888 | 0.6405917175 |
+| 16 | B1+NFD+SAM | 0.5567399196 | 0.6750062540 | 0.6552625632 |
+| 64 | Historical B1+NFD | 0.5984255557 | 0.6990219074 | 0.6734654239 |
+| 64 | B1+NFD+SAM | 0.6237007732 | 0.7172299271 | 0.6919933940 |
+
+The 16-bit gains were +0.0155477541/+0.0161764652/+0.0146708456;
+the 64-bit gains were +0.0252752175/+0.0182080197/+0.0185279701
+(ALL/100/1000). Both historical references were actually loaded from their
+original metrics.json files, not from the six-decimal document fallback:
+
+- 16-bit original run suffix ac0f8d38af38; metrics SHA256
+  d8a5691980dac5bb41b24d0837f98b0299df98af101dd4df1f181173c6ca6fa9.
+- 64-bit original run suffix 715253eea766; metrics SHA256
+  ff2c5c87f9eccfc311d55582eb07c4112efcec5149d4e84a140ad90c5523f9d8.
+
+The generic report note originally mentioned table-rounding uncertainty even
+when both sources were saved metric files. That presentation issue is corrected:
+only a real user-table fallback receives that warning. Numerical results,
+checkpoints, query codes and scores are unchanged; no re-evaluation is needed.
+The local checkout did not independently load the remote artifacts.
+
+Together with the previous 32-bit query result 0.607899/0.706845/0.686009,
+all nine fixed-seed query metrics improved over B1+NFD. Preserve this as a
+positive CIFAR-100 seed-60 result across the three code lengths. It establishes
+the empirical value of adding ordinary SAM in this setting; it does not establish
+an original optimizer, multi-seed evidence or a causal explanation of the gain.
+The 16/64-bit controls are historical, whereas the 32-bit comparison used a fresh
+control reproducing its historical metrics. No additional training is implied
+by recording the completed result.

@@ -296,6 +296,13 @@ class TransferTests(unittest.TestCase):
                         configs[p], {"selected_epoch": 300}, {}, {"checkpoint_sha256": "checkpoint"})), \
                     patch.object(transfer, "run_process", side_effect=run), patch("builtins.print"):
                 report = transfer.evaluate_queries(root, 0)
+                self.assertIn("six displayed decimals", report["note"])
+                for item in plan["items"]:
+                    item["historical_query"]["source_kind"] = "saved-query-metrics"
+                (root / "transfer_plan.json").write_text(json.dumps(plan))
+                saved_report = transfer.query_report(root)
+                self.assertIn("stored precision", saved_report["note"])
+                self.assertNotIn("rounding uncertainty", saved_report["note"])
             self.assertEqual(events, ["dry", "dry", "query", "query"])
             self.assertEqual(len(report["results"]), 2)
             self.assertIsNone(report["sam_minus_control"])

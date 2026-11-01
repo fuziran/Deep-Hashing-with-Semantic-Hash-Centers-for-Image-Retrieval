@@ -214,13 +214,21 @@ def query_report(root):
     deltas = {str(bit): {key: values[bit, "sam"][key] - (historical[str(bit)]["query_metrics"][key] if historical
                                                       else values[bit, "control"][key])
                         for key in single.METRICS} for bit in BITS}
+    if historical:
+        note = "Historical query references are reused in SAM-only mode. "
+        if any(reference.get("source_kind") == "user-reported-query-table" for reference in historical.values()):
+            note += "User-table baselines have six displayed decimals; their deltas inherit rounding uncertainty. "
+        else:
+            note += "Baselines are read from saved query metric files at their stored precision. "
+        note += "No fresh paired controls or novelty is implied."
+    else:
+        note = "Single-seed fixed-parameter transfer of existing SAM."
     return save_report(root / "query", "query_report", dict(
         seed=60, rho=.05, query_evaluated=True, counts=dict(query=5000, database=45000),
         results=results, historical_references=historical, sam_minus_reference_query=deltas,
         sam_minus_control=deltas if not historical else None,
         comparison="historical-reference" if historical else "fresh-paired-control",
-        note="Historical query references are reused in SAM-only mode. User-table baselines have six displayed decimals; deltas inherit rounding uncertainty. No fresh paired controls or novelty is implied." if historical
-             else "Single-seed fixed-parameter transfer of existing SAM."))
+        note=note))
 
 
 def main():
