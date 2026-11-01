@@ -63,6 +63,7 @@ class NeighborhoodFeatureDistillation(nn.Module):
                              basis_sha256=tensor_sha256(self.basis),
                              ranks=ranks, feature_dim=dim)
         self.components = {}
+        self.last_teacher_features = None
 
     def train(self, mode=True):
         super().train(mode)
@@ -103,6 +104,7 @@ class NeighborhoodFeatureDistillation(nn.Module):
         self.teacher.eval()
         with torch.no_grad():
             teacher_features = self.teacher.forward_features(images)
+            self.last_teacher_features = teacher_features.detach()
         return self.feature_loss(student_features, teacher_features, targets)
 
 

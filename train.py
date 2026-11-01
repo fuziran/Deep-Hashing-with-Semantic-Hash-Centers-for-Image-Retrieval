@@ -1,4 +1,5 @@
 import copy
+import hashlib
 import json
 import os
 import random
@@ -24,6 +25,7 @@ class CSQLoss(torch.nn.Module):
         self.hash_targets = hash_center.to(args.device)
         self.multi_label_random_center = torch.randint(2, (bit,)).float().to(args.device)
         self.criterion = torch.nn.BCELoss().to(args.device)
+        self.components = {}
 
     def forward(self, output, labels, indices, args):
         del indices
@@ -33,6 +35,7 @@ class CSQLoss(torch.nn.Module):
             0.5 * (continuous_code + 1), 0.5 * (target_center + 1)
         )
         quantization_loss = (continuous_code.abs() - 1).pow(2).mean()
+        self.components = dict(loss_center=float(center_loss.detach()), loss_quant=float(quantization_loss.detach()))
         return center_loss + args.lambd * quantization_loss
 
     def label2center(self, labels):
@@ -117,6 +120,18 @@ def train_val(
         raise ValueError("I2-NFD requires exactly one prepared frozen distiller")
     bit = args.code_length
     net = args.net(bit).to(args.device)
+    sam_rho = getattr(args, "sam_rho", 0.)
+    if sam_rho > 0 and (nfd is None or not getattr(args, "skip_query", False)):
+        raise ValueError("SAM requires prepared NFD and validation-only training")
+    audit_sam = getattr(args, "sam_version", None) is not None
+    if audit_sam:
+        from utils.reliable_relation import state_sha256
+        os.makedirs(args.run_dir, exist_ok=True)
+        with open(os.path.join(args.run_dir, "training_start.json"), "w", encoding="utf-8") as stream:
+            json.dump(dict(initial_state_sha256=state_sha256(net.state_dict()), sam_rho=sam_rho,
+                           batches_per_epoch=len(train_loader), base_optimizer="RMSprop"), stream, indent=2)
+    if sam_rho > 0:
+        print(f"SAM enabled: rho={sam_rho}, RMSprop, two student passes, one teacher pass, first-pass BN buffers", flush=True)
     optimizer = optim.RMSprop(net.parameters(), lr=args.lr, weight_decay=1e-5)
     scheduler = lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=args.epoch, eta_min=1e-7
@@ -141,14 +156,37 @@ def train_val(
             "loss_nfd", "nfd_feature_mse", "nfd_projected_error", "nfd_mean_rank",
         )} if nfd is not None else None
         nfd_batches = 0
+        sam_totals, gradient_sample = {}, {}
+        order_digest, first_images_digest = hashlib.sha256(), None
         if nfd is not None:
             from utils.neighbor_feature_distill import nfd_weight
             strength = nfd_weight(epoch + 1, args.nfd_weight,
                                   args.nfd_warmup, args.nfd_ramp_end)
-        for images, labels, indices in train_loader:
+        for batch_index, (images, labels, indices) in enumerate(train_loader):
+            if audit_sam:
+                from utils.reliable_relation import tensor_sha256
+                order_digest.update(torch.as_tensor(indices).cpu().numpy().tobytes())
+                if batch_index == 0:
+                    first_images_digest = tensor_sha256(images[:2])
             images = images.to(args.device, non_blocking=True)
             labels = labels.to(args.device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
+            if sam_rho > 0:
+                from utils.sam_nfd import sam_nfd_step
+                batch_loss, sampled = sam_nfd_step(net, optimizer, criterion, nfd, images, labels, indices,
+                                                  args, strength, sample_gradients=batch_index == 0)
+                total_loss += batch_loss
+                if batch_index == 0:
+                    gradient_sample = sampled
+                for key, value in criterion.components.items():
+                    sam_totals[key] = sam_totals.get(key, 0.) + value
+                if strength > 0:
+                    for key in nfd_totals:
+                        nfd_totals[key] += nfd.components[key]
+                    nfd_batches += 1
+                if (batch_index + 1) % 25 == 0:
+                    print(f"{args.info} epoch={epoch + 1} batch={batch_index + 1}/{len(train_loader)} clean_loss={batch_loss:.5f}", flush=True)
+                continue
             if nfd is not None and strength > 0:
                 output, features = net.forward_with_features(images)
             else:
@@ -178,6 +216,12 @@ def train_val(
             "lr": learning_rates[-1],
             "seconds": time.time() - started,
         }
+        if audit_sam:
+            record.update(train_order_sha256=order_digest.hexdigest(), first_batch_images_sha256=first_images_digest,
+                          optimizer_updates=len(train_loader), student_training_passes=len(train_loader) * (2 if sam_rho > 0 else 1),
+                          teacher_training_passes=len(train_loader) if strength > 0 else 0)
+        record.update({key: value / max(len(train_loader), 1) for key, value in sam_totals.items()})
+        record.update(gradient_sample)
         if nfd is not None:
             record["nfd_weight"] = strength
             record["loss_nfd"] = nfd_totals["loss_nfd"] / nfd_batches if nfd_batches else 0.0
@@ -211,6 +255,21 @@ def train_val(
             with open(os.path.join(args.run_dir, "training_history.json"), "w", encoding="utf-8") as f:
                 json.dump(history, f, ensure_ascii=False, indent=2)
 
+    os.makedirs(args.run_dir, exist_ok=True)
+    torch.save(best_state, os.path.join(args.run_dir, "best_model_state.pt"))
+    with open(os.path.join(args.run_dir, "training_history.json"), "w", encoding="utf-8") as stream:
+        json.dump(history, stream, ensure_ascii=False, indent=2)
+    from utils.experiment import selection_receipt
+    receipt = selection_receipt(args.run_dir)
+    if getattr(args, "skip_query", False):
+        summary = dict(**receipt, selected_epoch=best_epoch, selection_metric="validation mAP@ALL",
+                       query_evaluated=False, query_metrics=None)
+        summary["best_validation_mAP@ALL"] = best_validation_map
+        with open(os.path.join(args.run_dir, "metrics.json"), "w", encoding="utf-8") as stream:
+            json.dump(summary, stream, indent=2)
+        _save_curves(args.run_dir, losses, learning_rates)
+        print(f"Selected epoch {best_epoch}; final query evaluation skipped", flush=True)
+        return summary
     net.load_state_dict(best_state)
     net.to(args.device)
     final_metrics, pr_data, query_binary, query_label, database_binary, database_label = (
@@ -224,14 +283,15 @@ def train_val(
         args.topK,
     )
     summary = {
+        **receipt,
         "selected_epoch": best_epoch,
         "selection_metric": "validation mAP@ALL",
         "best_validation_mAP@ALL": best_validation_map,
         "query_metrics": final_metrics,
+        "query_evaluated": True,
     }
 
     os.makedirs(args.run_dir, exist_ok=True)
-    torch.save(best_state, os.path.join(args.run_dir, "best_model_state.pt"))
     torch.save(
         {
             "query_binary": query_binary,
@@ -243,8 +303,6 @@ def train_val(
         },
         os.path.join(args.run_dir, "retrieval_outputs.pt"),
     )
-    with open(os.path.join(args.run_dir, "training_history.json"), "w", encoding="utf-8") as f:
-        json.dump(history, f, ensure_ascii=False, indent=2)
     with open(os.path.join(args.run_dir, "metrics.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
     _save_curves(args.run_dir, losses, learning_rates)

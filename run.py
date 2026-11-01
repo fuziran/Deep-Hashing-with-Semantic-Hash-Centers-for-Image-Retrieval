@@ -91,12 +91,23 @@ def load_config():
     parser.add_argument("--nfd-topk", type=int, default=5)
     parser.add_argument("--nfd-warmup", type=int, default=20)
     parser.add_argument("--nfd-ramp-end", type=int, default=40)
+    parser.add_argument("--sam-rho", type=float, default=0., help="Ordinary non-adaptive SAM radius; 0 preserves NFD")
+    parser.add_argument("--skip-query", action="store_true")
+    parser.add_argument("--expected-dataset-sha256", help="Preflight file-content digest for the fixed SAM run")
     parser.add_argument(
         "--non-deterministic",
         action="store_true",
         help="Disable deterministic algorithms; not recommended for reported B0 runs.",
     )
     args = parser.parse_args()
+    if not math.isfinite(args.sam_rho) or args.sam_rho < 0:
+        parser.error("SAM rho must be finite and nonnegative")
+    if args.sam_rho > 0 and (args.variant != "b2nfd" or args.dataset.lower() != "nabirds-b" or not args.skip_query):
+        parser.error("SAM requires NABirds-B b2nfd and --skip-query; final query is a separate operation")
+    if args.variant == "b2nfd":
+        from utils.sam_nfd import VERSION as SAM_VERSION
+        args.sam_version = SAM_VERSION
+        args.sam_policy = "L2-nonadaptive-all-student-parameters; same-input-RNG; first-pass-BN; one-teacher-forward"
 
     if args.val_per_class is None:
         args.val_per_class = 2 if args.dataset.lower() == "nabirds-b" else 10
@@ -176,6 +187,8 @@ def main():
         _,
         num_database,
     ) = load_data(args)
+    if args.expected_dataset_sha256 and args.dataset_content_sha256 != args.expected_dataset_sha256:
+        raise ValueError("Dataset contents changed after SAM preflight")
 
     nfd = None
     centers = None
@@ -233,6 +246,9 @@ def main():
             "nfd_teacher_sha256": args.nfd_teacher_sha256,
             "nfd_basis_sha256": args.nfd_basis_sha256,
             "nfd_implementation_sha256": args.nfd_implementation_sha256,
+            "sam_version": args.sam_version, "sam_rho": args.sam_rho,
+            "sam_policy": args.sam_policy, "skip_query": args.skip_query,
+            "dataset_content_sha256": args.dataset_content_sha256,
         })
     args.run_id = stable_config_hash(run_config)
     args.run_dir = os.path.join(

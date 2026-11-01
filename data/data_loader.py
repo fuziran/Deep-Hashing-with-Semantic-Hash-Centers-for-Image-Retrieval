@@ -198,6 +198,19 @@ def _stratified_split_nabirds_train(labels, num_classes, seed, val_per_class):
     return train_indices, val_indices
 
 
+def _nabirds_content_sha256(paths, labels, root):
+    """Bind new runs to actual file contents without changing the legacy split hash."""
+    from utils.experiment import file_sha256
+    digest = hashlib.sha256()
+    for index, (path, label) in enumerate(zip(paths, labels), 1):
+        relative = os.path.relpath(path, root).replace(os.sep, "/")
+        digest.update(json.dumps([relative, int(label), file_sha256(path)], ensure_ascii=False).encode("utf-8"))
+        digest.update(b"\n")
+        if index % 10000 == 0:
+            print(f"NABirds-B file-content check: {index}/{len(paths)}", flush=True)
+    return digest.hexdigest()
+
+
 class NABirdsHashDataset(Dataset):
     def __init__(self, samples, labels, indices, num_classes, transform=None):
         self.samples = samples
@@ -263,6 +276,9 @@ def _load_nabirds_data(args):
     for indices in (train_idx, val_idx, query_idx, database_idx):
         digest.update(np.asarray(indices, dtype="<i8").tobytes())
     args.split_hash = digest.hexdigest()
+    args.dataset_content_sha256 = _nabirds_content_sha256(paths, labels, root)
+    args.dataset_counts = {"train": int(len(train_idx)), "validation": int(len(val_idx)),
+                           "query": int(len(query_idx)), "database": int(len(database_idx))}
     split_dir = os.path.join(args.output_dir, "splits")
     os.makedirs(split_dir, exist_ok=True)
     stem = f"{args.dataset}_seed{args.seed}_val{args.val_per_class}_{args.split_hash[:12]}"
@@ -281,6 +297,7 @@ def _load_nabirds_data(args):
             "source_counts": {"train": num_train, "query": num_query,
                               "database": len(database_idx)},
             "class_names": class_names, "sha256": args.split_hash,
+            "dataset_content_sha256": args.dataset_content_sha256,
         }, output, ensure_ascii=False, indent=2)
 
     normalize = transforms.Normalize(

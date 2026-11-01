@@ -36,6 +36,22 @@ def current_git_commit():
         return "unknown"
 
 
+def file_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def selection_receipt(run_dir):
+    files = {"checkpoint_sha256": "best_model_state.pt", "training_config_sha256": "config.json",
+             "training_history_sha256": "training_history.json"}
+    return {"selection_receipt_version": 1, **{
+        key: file_sha256(os.path.join(run_dir, name)) if os.path.isfile(os.path.join(run_dir, name)) else None
+        for key, name in files.items()}}
+
+
 def source_sha256():
     """Identify local code even before the user commits the new branch."""
     from pathlib import Path
@@ -45,6 +61,8 @@ def source_sha256():
         "run.py", "network.py", "GenerateSimilarityMatrix.py",
         "GenerateSemanticHashCenters.py", "train.py", "data/data_loader.py",
         "utils/experiment.py", "utils/tools.py", "utils/reliable_relation.py",
+        "utils/frozen_b1.py", "utils/neighbor_feature_distill.py", "utils/sam_nfd.py",
+        "utils/sam_diagnostics.py",
     ):
         digest.update(relative.encode())
         # A checkout on Linux/Windows should have the same source identity.
@@ -124,6 +142,8 @@ def write_run_manifest(args):
         if isinstance(value, (str, int, float, bool, list, tuple, type(None)))
     }
     manifest["device"] = str(args.device)
+    if hasattr(args, "dataset_counts"):
+        manifest["dataset_counts"] = args.dataset_counts
     manifest["torch_version"] = torch.__version__
     manifest["torch_cuda_version"] = torch.version.cuda
     manifest["cuda_available"] = torch.cuda.is_available()

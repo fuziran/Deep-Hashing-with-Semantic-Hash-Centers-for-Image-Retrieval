@@ -232,6 +232,7 @@ class NFDTests(unittest.TestCase):
 
             import run
             args.output_dir = str(root / "new_runs")
+            args.dataset_content_sha256 = "synthetic-content"
             loader = argparse.Namespace(generator=torch.Generator())
             with patch("run.load_config", return_value=args), \
                  patch("run.load_data", return_value=(loader, None, None, None, None,
