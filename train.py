@@ -126,7 +126,7 @@ def train_val(
 
     best_validation_map = float("-inf")
     best_epoch = 0
-    best_state = {key: value.detach().cpu() for key, value in net.state_dict().items()}
+    best_state = {key: value.detach().cpu().clone() for key, value in net.state_dict().items()}
     history, losses, learning_rates = [], [], []
 
     for epoch in range(args.epoch):
@@ -134,7 +134,7 @@ def train_val(
         learning_rates.append(optimizer.param_groups[0]["lr"])
         net.train()
         total_loss = 0.0
-        for images, labels, indices in train_loader:
+        for batch_index, (images, labels, indices) in enumerate(train_loader):
             images = images.to(args.device, non_blocking=True)
             labels = labels.to(args.device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
@@ -145,6 +145,8 @@ def train_val(
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
+            if (batch_index + 1) % 25 == 0:
+                print(f"{args.info} epoch={epoch+1} batch={batch_index+1}/{len(train_loader)}", flush=True)
         scheduler.step()
         epoch_loss = total_loss / max(len(train_loader), 1)
         losses.append(epoch_loss)
@@ -165,7 +167,7 @@ def train_val(
                 best_validation_map = validation_metrics["mAP@ALL"]
                 best_epoch = epoch + 1
                 best_state = {
-                    key: value.detach().cpu() for key, value in net.state_dict().items()
+                    key: value.detach().cpu().clone() for key, value in net.state_dict().items()
                 }
             print(
                 f"{args.info} epoch={epoch + 1} loss={epoch_loss:.5f} "
@@ -176,6 +178,9 @@ def train_val(
         else:
             print(f"{args.info} epoch={epoch + 1} loss={epoch_loss:.5f}")
         history.append(record)
+        with open(os.path.join(args.run_dir, "training_history.json"), "w", encoding="utf-8") as stream:
+            json.dump(history, stream, indent=2)
+        torch.save(best_state, os.path.join(args.run_dir, "best_model_state.pt"))
 
     net.load_state_dict(best_state)
     net.to(args.device)
@@ -194,6 +199,8 @@ def train_val(
         "selection_metric": "validation mAP@ALL",
         "best_validation_mAP@ALL": best_validation_map,
         "query_metrics": final_metrics,
+        "query_evaluated": True,
+        "counts": dict(query=len(query_loader.dataset), database=len(database_loader.dataset)),
     }
 
     os.makedirs(args.run_dir, exist_ok=True)
@@ -211,6 +218,12 @@ def train_val(
     )
     with open(os.path.join(args.run_dir, "training_history.json"), "w", encoding="utf-8") as f:
         json.dump(history, f, ensure_ascii=False, indent=2)
+    from utils.experiment import file_sha256
+    for key, name in (("checkpoint_sha256", "best_model_state.pt"),
+                      ("training_history_sha256", "training_history.json"),
+                      ("training_config_sha256", "config.json"),
+                      ("retrieval_outputs_sha256", "retrieval_outputs.pt")):
+        summary[key] = file_sha256(os.path.join(args.run_dir, name))
     with open(os.path.join(args.run_dir, "metrics.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
     _save_curves(args.run_dir, losses, learning_rates)

@@ -4,6 +4,8 @@ __pycache__/
 
 data/cifar-100-python/
 data/NABirds-B/
+data/stanford_cars-new-seg/
+save_stanford_cars_b0*/
 save/
 save_nabirds_b/
 *.whl

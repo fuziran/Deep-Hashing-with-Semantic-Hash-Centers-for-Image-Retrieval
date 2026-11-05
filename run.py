@@ -15,6 +15,7 @@ from utils.experiment import (
     current_git_commit,
     seed_everything,
     stable_config_hash,
+    source_sha256,
     write_run_manifest,
 )
 
@@ -22,6 +23,10 @@ from utils.experiment import (
 def load_config():
     parser = argparse.ArgumentParser(description="Faithful and auditable SHC B0 baseline")
     parser.add_argument("--seed", default=60, type=int)
+    parser.add_argument("--variant", choices=("b0",), default="b0")
+    parser.add_argument("--paired-stage-seeds", action="store_true",
+                        help="Reset hash-stage RNG/order independently of classifier cache reuse.")
+    parser.add_argument("--expected-dataset-sha256")
     parser.add_argument("--info", default="[SHC-B0]", type=str)
     parser.add_argument("--dataset", default="cifar-100-new-seg", type=str)
     parser.add_argument("--num-classes", default=100, type=int)
@@ -42,7 +47,7 @@ def load_config():
     parser.add_argument("--cpu", action="store_true")
     parser.add_argument(
         "--val-per-class", default=None, type=int,
-        help="Training images held out per class: CIFAR-100 defaults to 10, NABirds-B to 2.",
+        help="Training holdout per class: CIFAR-100 defaults to 10; NABirds-B/Cars-B to 2.",
     )
     parser.add_argument(
         "--mask-strategy",
@@ -77,7 +82,7 @@ def load_config():
     args = parser.parse_args()
 
     if args.val_per_class is None:
-        args.val_per_class = 2 if args.dataset.lower() == "nabirds-b" else 10
+        args.val_per_class = 2 if args.dataset.lower() in ("nabirds-b", "stanford_cars-b") else 10
 
     if args.force_recompute and args.similarity_cache:
         parser.error("--force-recompute and --similarity-cache cannot be used together")
@@ -94,6 +99,7 @@ def load_config():
         args.device = torch.device(f"cuda:{args.gpu}")
     args.net = ResNet
     args.git_commit = current_git_commit()
+    args.source_sha256 = source_sha256()
     return args
 
 
@@ -112,6 +118,8 @@ def main():
         _,
         num_database,
     ) = load_data(args)
+    if args.expected_dataset_sha256 and args.dataset_content_sha256 != args.expected_dataset_sha256:
+        raise ValueError("Dataset contents differ from the preflight")
 
     run_config = {
         "dataset": args.dataset,
@@ -127,24 +135,35 @@ def main():
         "validation_per_class": args.val_per_class,
         "git_commit": args.git_commit,
     }
+    if args.dataset.lower() == "stanford_cars-b":
+        run_config.update(source_sha256=args.source_sha256, dataset_content_sha256=args.dataset_content_sha256,
+            batch_size=args.batch_size, num_workers=args.num_workers, test_map=args.test_map,
+            paired_stage_seeds=args.paired_stage_seeds, deterministic=not args.non_deterministic)
     args.run_id = stable_config_hash(run_config)
     args.run_dir = os.path.join(
         args.output_dir,
         "runs",
         f"{args.dataset}_B0_{args.code_length}bit_seed{args.seed}_{args.run_id}",
     )
+    if os.path.exists(os.path.join(args.run_dir, "metrics.json")):
+        raise FileExistsError(f"Completed run already exists: {args.run_dir}")
     write_run_manifest(args)
 
     similarity = GenerateSimilarityMatrix(
         args, train_loader, relation_loader, val_loader
     )
+    write_run_manifest(args)
     if args.stage == "similarity":
         return
 
     centers = GenerateSemanticHashCenters(args, similarity.to(args.device))
+    write_run_manifest(args)
     if args.stage == "centers":
         return
 
+    if args.paired_stage_seeds:
+        seed_everything(args.seed, deterministic=not args.non_deterministic)
+        train_loader.generator.manual_seed(args.seed)
     train_val(
         args,
         centers,

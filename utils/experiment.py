@@ -36,6 +36,24 @@ def current_git_commit():
         return "unknown"
 
 
+def file_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def source_sha256():
+    from pathlib import Path
+    root, digest = Path(__file__).resolve().parents[1], hashlib.sha256()
+    for relative in ("run.py", "train.py", "network.py", "GenerateSimilarityMatrix.py",
+                     "GenerateSemanticHashCenters.py", "data/data_loader.py", "utils/tools.py", "utils/experiment.py"):
+        digest.update(relative.encode())
+        digest.update((root / relative).read_text(encoding="utf-8").encode())
+    return digest.hexdigest()
+
+
 def build_cache_metadata(args, stage):
     metadata = {
         "stage": stage,
@@ -63,6 +81,12 @@ def build_cache_metadata(args, stage):
         )
     if stage in {"mds", "centers"}:
         metadata["code_length"] = args.code_length
+    if args.dataset.lower() == "stanford_cars-b":
+        metadata["dataset_content_sha256"] = args.dataset_content_sha256
+        metadata["source_sha256"] = args.source_sha256
+        metadata["training_protocol"] = dict(batch_size=args.batch_size, num_workers=args.num_workers,
+            test_map=args.test_map, deterministic=not args.non_deterministic,
+            paired_stage_seeds=args.paired_stage_seeds)
     metadata["config_hash"] = stable_config_hash(metadata)
     return metadata
 
@@ -100,7 +124,10 @@ def write_run_manifest(args):
     manifest["cublas_workspace_config"] = os.environ.get(
         "CUBLAS_WORKSPACE_CONFIG"
     )
-    if torch.cuda.is_available():
-        manifest["gpu"] = torch.cuda.get_device_name(args.device)
+    if hasattr(args, "dataset_counts"):
+        manifest["dataset_counts"] = args.dataset_counts
+        manifest["source_counts"] = args.source_counts
+    if torch.cuda.is_available() and args.device.type == "cuda":
+        manifest["gpu_name"] = torch.cuda.get_device_name(args.device)
     with open(os.path.join(args.run_dir, "config.json"), "w", encoding="utf-8") as f:
         json.dump(manifest, f, ensure_ascii=False, indent=2)

@@ -74,7 +74,7 @@ def TrainClassificationNetwork(args, train_loader, val_loader):
         started = time.time()
         net.train()
         epoch_loss, correct, total = 0.0, 0, 0
-        for images, labels, _ in train_loader:
+        for batch_index, (images, labels, _) in enumerate(train_loader):
             images = images.to(args.device, non_blocking=True)
             targets = labels.argmax(dim=1).to(args.device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
@@ -87,6 +87,8 @@ def TrainClassificationNetwork(args, train_loader, val_loader):
             epoch_loss += loss.item() * targets.numel()
             correct += (logits.argmax(dim=1) == targets).sum().item()
             total += targets.numel()
+            if (batch_index + 1) % 25 == 0:
+                print(f"classifier epoch={epoch+1} batch={batch_index+1}/{len(train_loader)}", flush=True)
         scheduler.step()
 
         should_validate = (

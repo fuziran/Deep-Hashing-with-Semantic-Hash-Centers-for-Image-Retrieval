@@ -145,7 +145,7 @@ class CIFAR100HashDataset(Dataset):
 _IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
 
-def _resolve_nabirds_root(root):
+def _resolve_nabirds_root(root, dataset="NABirds-B"):
     for candidate in (root, os.path.join(root, "images")):
         if candidate and all(
             os.path.isdir(os.path.join(candidate, split))
@@ -153,7 +153,7 @@ def _resolve_nabirds_root(root):
         ):
             return os.path.abspath(candidate)
     raise FileNotFoundError(
-        "NABirds-B requires train/, query/, database/ class directories "
+        f"{dataset} requires train/, query/, database/ class directories "
         "under --root or --root/images"
     )
 
@@ -221,24 +221,58 @@ class NABirdsHashDataset(Dataset):
 
 
 def _load_nabirds_data(args):
-    root = _resolve_nabirds_root(args.root)
+    return _load_directory_data(args)
+
+
+def _directory_content_sha256(paths, labels, root, boundaries):
+    """Fingerprint original bytes/labels and record cross-split content matches."""
+    digest, seen, duplicates = hashlib.sha256(), {}, []
+    total = len(paths)
+    print(f"Checking image contents: 0/{total}", flush=True)
+    for i, (path, label) in enumerate(zip(paths, labels)):
+        image_hash = hashlib.sha256()
+        with open(path, "rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                image_hash.update(chunk)
+        value = image_hash.hexdigest()
+        split = 0 if i < boundaries[0] else 1 if i < boundaries[1] else 2
+        for old_split, old_path, old_label in seen.get(value, []):
+            if old_split != split:
+                duplicates.append(dict(first=os.path.relpath(old_path, root).replace(os.sep, "/"),
+                    second=os.path.relpath(path, root).replace(os.sep, "/"), first_label=int(old_label),
+                    second_label=int(label), first_split=("train","query","database")[old_split],
+                    second_split=("train","query","database")[split], sha256=value))
+        seen.setdefault(value, []).append((split, path, label))
+        relative = os.path.relpath(path, root).replace(os.sep, "/")
+        digest.update(json.dumps([relative, int(label), value], ensure_ascii=False).encode("utf-8"))
+        digest.update(b"\n")
+        if (i + 1) % 2000 == 0 or i + 1 == total:
+            print(f"Checking image contents: {i+1}/{total}", flush=True)
+    if duplicates:
+        print(f"NOTE: {len(duplicates)} exact-content cross-split pairs recorded; original curated splits are preserved.", flush=True)
+    return digest.hexdigest(), duplicates
+
+
+def _load_directory_data(args):
+    dataset = args.dataset
+    root = _resolve_nabirds_root(args.root, dataset)
     scanned = [_scan_nabirds_split(root, split) for split in ("train", "query", "database")]
     class_names = scanned[0][1]
     if len(class_names) != args.num_classes:
         raise ValueError(
-            f"NABirds-B train/ has {len(class_names)} classes; "
+            f"{dataset} train/ has {len(class_names)} classes; "
             f"--num-classes is {args.num_classes}"
         )
     for split, (samples, classes) in zip(("train", "query", "database"), scanned):
         unknown = set(classes) - set(class_names)
         if unknown:
-            raise ValueError(f"NABirds-B {split}/ has classes absent from train/: {sorted(unknown)}")
+            raise ValueError(f"{dataset} {split}/ has classes absent from train/: {sorted(unknown)}")
         if not samples:
-            raise ValueError(f"NABirds-B {split}/ has no images")
+            raise ValueError(f"{dataset} {split}/ has no images")
     missing_database_classes = set(scanned[1][1]) - set(scanned[2][1])
     if missing_database_classes:
         raise ValueError(
-            "NABirds-B query classes without database positives: "
+            f"{dataset} query classes without database positives: "
             f"{sorted(missing_database_classes)}"
         )
     class_to_idx = {name: index for index, name in enumerate(class_names)}
@@ -246,7 +280,7 @@ def _load_nabirds_data(args):
     paths = [path for path, _ in all_samples]
     resolved_paths = [os.path.normcase(os.path.realpath(path)) for path in paths]
     if len(set(resolved_paths)) != len(resolved_paths):
-        raise ValueError("NABirds-B split directories contain duplicate image paths")
+        raise ValueError(f"{dataset} split directories contain duplicate image paths")
     labels = np.asarray([class_to_idx[name] for _, name in all_samples], dtype=np.int64)
     num_train, num_query = len(scanned[0][0]), len(scanned[1][0])
     train_idx, val_idx = _stratified_split_nabirds_train(
@@ -263,9 +297,21 @@ def _load_nabirds_data(args):
     for indices in (train_idx, val_idx, query_idx, database_idx):
         digest.update(np.asarray(indices, dtype="<i8").tobytes())
     args.split_hash = digest.hexdigest()
+    args.dataset_counts = dict(train=len(train_idx), validation=len(val_idx), query=len(query_idx), database=len(database_idx))
+    args.source_counts = dict(train=num_train, query=num_query, database=len(database_idx))
+    if dataset.lower() == "stanford_cars-b":
+        query_classes = {name for _, name in scanned[1][0]}
+        database_classes = {name for _, name in scanned[2][0]}
+        if query_classes - database_classes:
+            raise ValueError("Cars-B query classes have no database images")
+        args.dataset_content_sha256, args.exact_content_duplicates = _directory_content_sha256(
+            paths, labels, root, (num_train, num_train + num_query))
     split_dir = os.path.join(args.output_dir, "splits")
     os.makedirs(split_dir, exist_ok=True)
     stem = f"{args.dataset}_seed{args.seed}_val{args.val_per_class}_{args.split_hash[:12]}"
+    if hasattr(args, "exact_content_duplicates"):
+        with open(os.path.join(split_dir, stem + "_content_duplicates.json"), "w", encoding="utf-8") as stream:
+            json.dump(args.exact_content_duplicates, stream, ensure_ascii=False, indent=2)
     np.savez_compressed(
         os.path.join(split_dir, f"{stem}.npz"),
         train=train_idx, validation=val_idx, query=query_idx, database=database_idx,
@@ -281,6 +327,7 @@ def _load_nabirds_data(args):
             "source_counts": {"train": num_train, "query": num_query,
                               "database": len(database_idx)},
             "class_names": class_names, "sha256": args.split_hash,
+            **({"dataset_content_sha256": args.dataset_content_sha256} if hasattr(args, "dataset_content_sha256") else {}),
         }, output, ensure_ascii=False, indent=2)
 
     normalize = transforms.Normalize(
@@ -312,7 +359,7 @@ def _load_nabirds_data(args):
         DataLoader(make_dataset(query_idx, eval_transform), shuffle=False, **common_loader_args),
         DataLoader(make_dataset(database_idx, eval_transform), shuffle=False, **common_loader_args),
     )
-    print("========== NABirds-B dataset loaded ==========")
+    print(f"========== {dataset} dataset loaded ==========", flush=True)
     print(f"train: {len(train_idx)}, validation: {len(val_idx)}, "
           f"query: {len(query_idx)}, database: {len(database_idx)}")
     print(f"split sha256: {args.split_hash}")
@@ -320,11 +367,15 @@ def _load_nabirds_data(args):
 
 
 def load_data(args):
+    if args.dataset.lower() == "stanford_cars-b":
+        if args.num_classes != 196:
+            raise ValueError("Stanford_Cars-B requires --num-classes 196")
+        return _load_directory_data(args)
     if args.dataset.lower() == "nabirds-b":
         return _load_nabirds_data(args)
     if "cifar" not in args.dataset.lower():
         raise NotImplementedError(
-            "The B0 loader supports CIFAR-100 and NABirds-B only."
+            "The B0 loader supports CIFAR-100, NABirds-B and Stanford_Cars-B only."
         )
 
     images, labels = _load_cifar100_raw(args.root)
