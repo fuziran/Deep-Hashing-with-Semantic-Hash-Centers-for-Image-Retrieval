@@ -9,6 +9,8 @@ from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 
+from data.nabirds_manifest import read_verified_nabirds
+
 
 def _unpickle(file_path):
     with open(file_path, "rb") as f:
@@ -221,6 +223,9 @@ class NABirdsHashDataset(Dataset):
 
 
 def _load_nabirds_data(args):
+    frozen = read_verified_nabirds(args.root)
+    if frozen is not None:
+        return _load_frozen_nabirds_data(args, frozen)
     root = _resolve_nabirds_root(args.root)
     scanned = [_scan_nabirds_split(root, split) for split in ("train", "query", "database")]
     class_names = scanned[0][1]
@@ -317,6 +322,62 @@ def _load_nabirds_data(args):
           f"query: {len(query_idx)}, database: {len(database_idx)}")
     print(f"split sha256: {args.split_hash}")
     return (*loaders, len(train_idx), len(val_idx), len(query_idx), len(database_idx))
+
+
+def _load_frozen_nabirds_data(args, frozen):
+    root, metadata, rows = frozen
+    class_names = metadata["class_names"]
+    if len(class_names) != args.num_classes:
+        raise ValueError("--num-classes differs from the frozen NABirds class mapping")
+    if args.val_per_class != metadata["validation_per_class"]:
+        raise ValueError("--val-per-class differs from the frozen NABirds validation split")
+    paths = [str(root / row["path"]) for row in rows]
+    labels = np.asarray([row["class_index"] for row in rows], dtype=np.int64)
+    indices = {split: np.asarray([i for i, row in enumerate(rows) if row["split"] == split], dtype=np.int64)
+               for split in ("train", "validation", "query", "database")}
+    # All four membership lists, labels and image bytes are bound by this hash.
+    # The training seed changes shuffling/augmentation, never these memberships.
+    args.split_hash = metadata["dataset_sha256"]
+    split_dir = os.path.join(args.output_dir, "splits")
+    os.makedirs(split_dir, exist_ok=True)
+    stem = f"NABirds-B_verified_disjoint_v1_{args.split_hash[:12]}"
+    np.savez_compressed(
+        os.path.join(split_dir, f"{stem}.npz"), **indices, labels=labels,
+        paths=np.asarray([row["path"] for row in rows]), class_names=np.asarray(class_names),
+    )
+    with open(os.path.join(split_dir, f"{stem}.json"), "w", encoding="utf-8") as output:
+        json.dump({"dataset": args.dataset, "protocol": metadata["protocol"],
+                   "seed": metadata["seed"], "training_seed": args.seed,
+                   "validation_per_class": metadata["validation_per_class"],
+                   "counts": metadata["counts"], "class_names": class_names,
+                   "sha256": args.split_hash, "dataset_manifest": str(root / "dataset_manifest.json"),
+                   "image_sha256_verified": True}, output, ensure_ascii=False, indent=2)
+    normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    train_transform = transforms.Compose([
+        transforms.Resize(args.resize_size), transforms.RandomCrop(args.crop_size),
+        transforms.RandomHorizontalFlip(), transforms.ToTensor(), normalize,
+    ])
+    eval_transform = transforms.Compose([
+        transforms.Resize(args.resize_size), transforms.CenterCrop(args.crop_size),
+        transforms.ToTensor(), normalize,
+    ])
+    def make_dataset(split, transform):
+        return NABirdsHashDataset(paths, labels, indices[split], args.num_classes, transform)
+    common = {"batch_size": args.batch_size, "num_workers": args.num_workers,
+              "pin_memory": args.device.type == "cuda", "drop_last": False,
+              "worker_init_fn": _seed_worker}
+    generator = torch.Generator().manual_seed(args.seed)
+    loaders = (
+        DataLoader(make_dataset("train", train_transform), shuffle=True, generator=generator, **common),
+        DataLoader(make_dataset("train", eval_transform), shuffle=False, **common),
+        DataLoader(make_dataset("validation", eval_transform), shuffle=False, **common),
+        DataLoader(make_dataset("query", eval_transform), shuffle=False, **common),
+        DataLoader(make_dataset("database", eval_transform), shuffle=False, **common),
+    )
+    print("========== NABirds-B verified disjoint v1 (all image SHA256 verified) ==========")
+    print(", ".join(f"{split}: {len(indices[split])}" for split in indices))
+    print(f"Fixed split sha256: {args.split_hash}; training seed: {args.seed}")
+    return (*loaders, *(len(indices[split]) for split in indices))
 
 
 def load_data(args):

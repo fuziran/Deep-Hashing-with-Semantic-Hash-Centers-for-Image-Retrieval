@@ -93,45 +93,69 @@ binary codes are written under `save/`. Use `--stage similarity` or
 
 ### Audited B0 baseline (NABirds-B)
 
-Use the curated NABirds-B archive, with `train/`, `query/`, and `database/`
-directories under `images/`. The training directory must contain 555 class
-subdirectories; query classes must have matching training and database classes.
-The loader uses these existing splits; it never resamples the
-paper's B split from raw NABirds. It reserves two images per class from `train/`
-for validation, using `--seed 60`. The validation images are excluded from
-training and from the retrieval database. The query set is evaluated only after
-the best Stage 3 checkpoint has been chosen on validation mAP@ALL.
+Formal new experiments use **NABirds-B-verified-disjoint-v1**, stored at
+`D:\SHC-data\NABirds-B-verified-disjoint-v1`. The original archive
+`D:\SHC-data\NABirds-B.tar.gz` and extracted directory are preserved.
+See [the Chinese audit and protocol notes](docs/NABirds-B-verified-disjoint-v1.md).
 
-From the repository root on the GPU machine, set `NABIRDS_ROOT` to the extracted
-archive's `images` directory. The commands below run all three code lengths in
-separate run directories and leave the CIFAR-100 outputs untouched:
+The full audit checked all 50,167 files by image ID, file SHA256, decoded RGB
+SHA256 and EXIF-oriented RGB SHA256, and verified every archived image against
+the extracted copy. There are 48,562 unique images and 1,605 extra database
+copies (1,084 overlap training; 521 overlap query), with no decode failures or
+cross-label duplicates. Removing the copies alone would leave 45 classes with
+no retrieval positives, so v1 **repartitions all unique images by class**.
+It does not preserve original memberships or recover the author's split.
 
-```bash
-export CUBLAS_WORKSPACE_CONFIG=:4096:8
-NABIRDS_ROOT=/absolute/path/to/NABirds-B/images
-for bits in 16 32 64; do
-  python3 run.py --dataset NABirds-B --root "$NABIRDS_ROOT" \
-    --num-classes 555 --code-length "$bits" --seed 60 \
-    --lr 1e-4 --classify-epoch 300 --epoch 300 --test-map 5 \
-    --beta 1.0 --lambd 1e-4 --batch-size 64 --num-workers 4 \
-    --resize-size 256 --crop-size 224 --val-per-class 2 \
-    --topK -1 100 1000 --gpu 0 --output-dir ./save_nabirds_b
-done
+| Fixed split | Images | Classes |
+| --- | ---: | ---: |
+| Training | 15,274 | 555 |
+| Validation | 1,110 (2 per class) | 555 |
+| Query | 8,171 | 555 |
+| Retrieval database | 24,007 | 555 |
+
+The training pool remains 16,384 including validation. Split seed 60 and
+constrained proportional per-class quotas produce exact global totals, with
+positive counts for every class in all four sets. The four membership lists
+are frozen under `manifests/`; changing `--seed` changes training randomness
+only. The loader verifies the manifest checksums, all image SHA256 values,
+class coverage and absence of repeated IDs/content before training. Validation
+is not reselected from `train/`. Pass the dataset root (or its `images/`
+directory); the root contains `dataset_manifest.json`.
+
+Example in PowerShell, after installing the training environment:
+
+```powershell
+python run.py --dataset NABirds-B --root 'D:\SHC-data\NABirds-B-verified-disjoint-v1' `
+  --num-classes 555 --code-length 32 --seed 60 --lr 1e-4 `
+  --classify-epoch 300 --epoch 300 --test-map 5 `
+  --beta 1.0 --lambd 1e-4 --batch-size 64 --num-workers 4 `
+  --resize-size 256 --crop-size 224 --val-per-class 2 `
+  --topK -1 100 1000 --gpu 0 --output-dir ./save_nabirds_b_verified_disjoint_v1
 ```
 
-The loader writes the sorted class mapping, relative image paths, split
-indices, counts, and split SHA256 under `save_nabirds_b/splits/`. Check the
-printed counts against the extracted archive before committing to a long run.
-The PDF reports 16,384 train, 8,171 query, and 25,612 database images, but
-those counts do not sum to the 48,562 images it reports for the official A
-split. This code records the actual supplied B archive counts instead of
-silently changing its splits. After reserving validation, Stage 3 reports
-`mAP@ALL`, `mAP@100`, and `mAP@1000` in each run's `metrics.json`.
+Use the same dataset manifest for B0/B1 and later NFD/SAM experiments. Keep
+old results as exploratory records and use a new output directory and new
+Stage 1 caches for v1. Never mix legacy and v1 metrics. Query evaluation still
+occurs after checkpoint selection on validation mAP@ALL. The original
+directory-scanning loader remains available for reproducing legacy records;
+it does not certify the original split's content independence.
 
-The PDF uses a `1e-4` learning rate for non-CIFAR datasets, 300 epochs in
-Stages 1 and 3, batch size 64, and quantization weight `1e-4`. The fixed
-validation holdout and checkpoint selection follow this repository's audited
-B0 protocol and may differ from the paper's exact evaluation procedure.
+Preparation and verification (Pillow and NumPy, no PyTorch required):
+
+```powershell
+python tools/prepare_nabirds_disjoint.py audit --source 'D:\SHC-data\NABirds-B\NAbirds-new-seg\images' --archive 'D:\SHC-data\NABirds-B.tar.gz' --audit-dir tmp/nabirds_audit_new
+python tools/prepare_nabirds_disjoint.py plan --audit-dir tmp/nabirds_audit_new --seed 60 --val-per-class 2 --train-pool-count 16384 --query-count 8171
+python tools/prepare_nabirds_disjoint.py materialize --audit-dir tmp/nabirds_audit_new --destination 'D:\SHC-data\NABirds-B-verified-disjoint-new'
+python tools/prepare_nabirds_disjoint.py verify --audit-dir tmp/nabirds_audit_new --destination 'D:\SHC-data\NABirds-B-verified-disjoint-new'
+python -m unittest tests.test_nabirds_preparation -v
+```
+
+Materialization refuses to overwrite an existing directory and uses independent
+image copies. `audit/` contains the complete source/archive inventories,
+duplicate decisions and per-class split counts; `verification_report.json`
+records final checks, including unchanged original data. These checks detect
+exact ID/byte/pixel duplicates; they do not rule out every resized, recompressed
+or cropped near-duplicate, or different photos of the same individual bird.
 
 ## Precision Recall Curve
 the Precision Recall Curve in SHC is here:
